@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "psp2-core-parse"
+version = "0.1.0"
+description = "PlayStation Vita psp2core coredump analyzer and debugger"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "psp2_core_parse contributors"}]
+
+[project.scripts]
+psp2-core-parse = "psp2_core_parse.cli:main"
+psp2_core_parse = "psp2_core_parse.cli:main"
+
+[tool.setuptools]
+packages = ["psp2_core_parse"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

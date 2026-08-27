@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+from psp2_core_parse.cli import main
+
+raise SystemExit(main())
