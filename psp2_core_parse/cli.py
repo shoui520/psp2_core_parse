@@ -14,7 +14,7 @@ from .core import CoreDump, ParseError
 from .execution import AddressLocation, ExecutionContext, Thread
 from .kernel import KernelObjectRegistry
 from .support import decode_note, parse_memory_blocks, supporting_context
-from .symbols import Symbolizer, ToolError, disassemble_bytes, disassemble_core
+from .symbols import SourcePathMap, Symbolizer, ToolError, disassemble_address
 from .tty import TtyInfo
 
 
@@ -86,6 +86,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_core_arguments(item, images=True)
     item.add_argument("--tty-lines", type=int, default=12)
     item.add_argument("--stack-candidates", type=int, default=16)
+    item.add_argument("--disasm-before", type=integer, default=16, metavar="BYTES")
+    item.add_argument("--disasm-bytes", "--disasm-after", dest="disasm_after", type=positive_integer, default=64, metavar="BYTES")
+    item.add_argument("--no-source", action="store_true", help="do not ask objdump to interleave source code")
+    item.add_argument("--source-map", metavar="OLD=LOCAL", help="remap an absolute DWARF build prefix to a local source directory")
 
     item = commands.add_parser("info", help="show container integrity and inventory")
     _add_core_arguments(item)
@@ -200,7 +204,10 @@ def build_parser() -> argparse.ArgumentParser:
     item = commands.add_parser("disasm", help="disassemble captured or supplied-image code with VitaSDK objdump")
     _add_core_arguments(item, images=True)
     item.add_argument("address", nargs="?", type=integer, help="defaults to the crash PC")
-    item.add_argument("--bytes", type=positive_integer, default=64)
+    item.add_argument("--before", type=integer, default=16, metavar="BYTES")
+    item.add_argument("--bytes", "--after", dest="after", type=positive_integer, default=64, metavar="BYTES")
+    item.add_argument("--no-source", action="store_true", help="do not ask objdump to interleave source code")
+    item.add_argument("--source-map", metavar="OLD=LOCAL", help="remap an absolute DWARF build prefix to a local source directory")
     mode = item.add_mutually_exclusive_group()
     mode.add_argument("--thumb", action="store_true")
     mode.add_argument("--arm", action="store_true")
@@ -276,6 +283,11 @@ def _symbolizer(args) -> Symbolizer:
     return Symbolizer.from_specs(getattr(args, "image", ()))
 
 
+def _source_map(args) -> Optional[SourcePathMap]:
+    spec = getattr(args, "source_map", None)
+    return SourcePathMap.parse(spec) if spec else None
+
+
 def _location_from_summary(location: dict) -> AddressLocation:
     return AddressLocation(
         location["address"], location["module_index"], location["module_uid"],
@@ -323,6 +335,23 @@ def command_analyze(args) -> tuple[dict, str]:
     primary = result.get("primary_crash_thread")
     if primary and symbolizer.images:
         _symbolize_thread(primary, symbolizer)
+    if primary and primary.get("registers"):
+        registers = primary["registers"]
+        result["disassembly"] = disassemble_address(
+            core, _execution(core), symbolizer, registers["pc"],
+            thumb=registers["thumb"], before=args.disasm_before, after=args.disasm_after,
+            include_source=not args.no_source, source_map=_source_map(args),
+        )
+        result["disassembly"].update({
+            "selection": "primary-crash-pc",
+            "selection_reason": "architectural PC of the primary crashed thread",
+        })
+    else:
+        result["disassembly"] = {
+            "status": "unavailable", "selection": None,
+            "selection_reason": "no primary crash-PC register context was recovered",
+            "error": "no primary crash-PC register context was recovered",
+        }
     from .report import render_analysis_report
     return result, render_analysis_report(result)
 
@@ -931,43 +960,27 @@ def command_disasm(args) -> tuple[dict, str]:
         thumb = bool(address & 1)
     runtime_address = address & ~1
     symbolizer = _symbolizer(args)
-    location = execution.modules.locate(runtime_address) if execution.modules else None
-    symbol = symbolizer.symbolize(location) if location and symbolizer.images else None
-    try:
-        result = disassemble_core(core, runtime_address, args.bytes, thumb=thumb)
-        result["source"] = "captured-memory"
-    except ParseError as captured_error:
-        if not symbolizer.images:
-            raise
-        if location is None:
-            raise ParseError(
-                f"{captured_error}; runtime address {_hex(runtime_address)} is not mapped by MODULE_INFO"
-            ) from captured_error
-        image = symbolizer.image_for_module(location.module_name)
-        if image is None:
-            raise ParseError(
-                f"{captured_error}; no supplied image matches module {location.module_name}"
-            ) from captured_error
-        image_address = image.image_address(location)
-        data = image.linked_bytes(image_address, args.bytes)
-        result = {
-            "address": runtime_address, "size": len(data), "thumb": thumb,
-            "bytes": data.hex(), "text": disassemble_bytes(data, runtime_address, thumb=thumb),
-            "source": "supplied-image", "image": str(image.path),
-            "image_address": image_address, "runtime_location": location.summary(),
-            "captured_memory_error": str(captured_error),
-        }
-    if symbol:
-        result["symbol"] = symbol
-    lines = [
-        "Source: captured memory" if result["source"] == "captured-memory" else (
-            f"Source: supplied image {result['image']} at ELF {_hex(result['image_address'])} "
-            f"for runtime {_hex(runtime_address)}"
-        )
-    ]
-    symbol_detail = _symbol_text(symbol)
+    result = disassemble_address(
+        core, execution, symbolizer, runtime_address,
+        thumb=thumb, before=args.before, after=args.after,
+        include_source=not args.no_source, source_map=_source_map(args),
+    )
+    if result["status"] != "available":
+        raise ParseError(result.get("error") or "disassembly is unavailable")
+    lines = [f"Disassembly around {_hex(runtime_address)}", f"Source: {result['source']}"]
+    location = result.get("runtime_location")
+    if location:
+        lines.append(f"Runtime: {location['notation']} at {_hex(runtime_address)}")
+    if result.get("image_address") is not None:
+        lines.append(f"ELF: {_hex(result['image_address'])} in {result['image']}")
+    lines.append(f"Mode: {'Thumb' if result['thumb'] else 'ARM'}")
+    lines.append(f"Captured/ELF bytes: {result['byte_comparison']}")
+    lines.append(f"Source interleaved: {str(result['source_interleaved']).lower()}")
+    symbol_detail = _symbol_text(result.get("symbol"))
     if symbol_detail:
         lines.append(f"Symbol: {symbol_detail}")
+    lines.extend(f"Warning: {warning}" for warning in result["warnings"])
+    lines.extend(f"Note: {error}" for error in result["errors"])
     lines.append(result["text"])
     return result, "\n".join(lines)
 

@@ -310,6 +310,44 @@ def render_analysis_report(result: dict) -> str:
                 )
             )
 
+    disassembly = result.get("disassembly")
+    if disassembly is not None:
+        address = disassembly.get("runtime_address")
+        _heading(lines, f"DISASSEMBLY AROUND {_hex(address)}")
+        if disassembly["status"] != "available":
+            _field(lines, "Status", disassembly["status"])
+            _field(lines, "Reason", disassembly.get("error") or "unavailable")
+        else:
+            _field(lines, "Selection", disassembly.get("selection_reason") or "requested address")
+            _field(lines, "Runtime PC", _hex(address))
+            location = disassembly.get("runtime_location")
+            if location:
+                _field(lines, "Runtime location", location["notation"])
+            if disassembly.get("image_address") is not None:
+                _field(lines, "ELF PC", _hex(disassembly["image_address"]))
+                _field(lines, "Image", disassembly["image"])
+            _field(lines, "Mode", "Thumb" if disassembly["thumb"] else "ARM")
+            _field(lines, "Byte source", disassembly["source"])
+            _field(lines, "Captured / ELF match", disassembly["byte_comparison"])
+            _field(lines, "Source interleaved", str(disassembly["source_interleaved"]).lower())
+            captured = disassembly.get("captured_memory") or {}
+            image_memory = disassembly.get("image_memory") or {}
+            _field(lines, "Captured code", f"0x{captured.get('size', 0):x} bytes" if captured.get("available") else "unavailable")
+            if image_memory:
+                _field(lines, "ELF code", f"0x{image_memory.get('size', 0):x} bytes" if image_memory.get("available") else "unavailable")
+            symbol = disassembly.get("symbol") or {}
+            if symbol.get("function") and symbol["function"] != "??":
+                detail = symbol["function"]
+                if symbol.get("source") and symbol["source"] != "??:0":
+                    detail += f" at {symbol['source']}"
+                _field(lines, "Symbol", detail)
+            for warning in disassembly.get("warnings", []):
+                lines.append(f"    WARNING: {warning}")
+            for error in disassembly.get("errors", []):
+                lines.append(f"    NOTE: {error}")
+            lines.append("")
+            lines.extend(f"    {line}" if line else "" for line in disassembly["text"].splitlines())
+
     _heading(lines, "STACK_AND_INSTRUCTION_EVIDENCE")
     stack = primary.get("stack_evidence")
     instruction = primary.get("instruction_evidence")
