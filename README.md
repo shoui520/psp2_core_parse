@@ -13,6 +13,8 @@ Use a matching decrypted Vita ELF for symbols, source locations, disassembly, an
   --image application=application.elf
 ```
 
+The name before `=` must be the actual runtime module name reported by `modules`; use `application` only when that is the module's real name.
+
 VitaSDK must be available through `PATH` or `VITASDK` when using these image-backed features.
 
 Write the complete analysis as JSON:
