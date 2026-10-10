@@ -10,6 +10,8 @@ Copyright (c) 2022 Princess-of-Sleeping. MIT license; see LICENSE.
 from __future__ import annotations
 
 import struct
+import warnings
+from typing import Optional
 
 from .core import ParseError, ParseIssue
 
@@ -139,10 +141,34 @@ def decrypt_container(raw: bytes, issues: list[ParseIssue]) -> tuple[bytes, dict
     }
 
 
-def decrypt_kernel_info(description: bytes) -> bytes:
-    """Return a standalone decrypted ELF without modifying the captured note."""
+def decrypt_kernel_info(
+    description: bytes, *, strict: bool = False, issues: Optional[list[ParseIssue]] = None,
+) -> bytes:
+    """Return a decrypted ELF prefix; retain missing ranges in its original headers."""
+    def damaged(code: str, message: str, offset: Optional[int] = None) -> None:
+        if strict:
+            raise ParseError(message)
+        issue = ParseIssue("error", code, message, offset)
+        if issues is None:
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+        else:
+            issues.append(issue)
+
     image = description
-    if image[4:8] == b"\x7fELF":
+    if image[12:16] == b"\x7fELF" or image[:8] == struct.pack("<Q", 8):
+        if len(image) < 12:
+            raise ParseError("KERNEL_INFO version-8 wrapper is truncated")
+        version, size = struct.unpack_from("<QI", image)
+        if version != 8:
+            raise ParseError(f"unsupported KERNEL_INFO note version {version}")
+        if size != len(image) - 12:
+            damaged(
+                "kernel-info-wrapper-size",
+                f"KERNEL_INFO wrapper declares 0x{size:x} ELF bytes but 0x{len(image) - 12:x} "
+                "are captured; using the available note bytes",
+            )
+        image = image[12:]
+    elif image[4:8] == b"\x7fELF":
         version = struct.unpack_from("<I", image)[0]
         if version != 1:
             raise ParseError(f"unsupported KERNEL_INFO note version {version}")
@@ -154,35 +180,82 @@ def decrypt_kernel_info(description: bytes) -> bytes:
     header_size, ph_size, ph_count = struct.unpack_from("<3H", image, 40)
     ph_offset = struct.unpack_from("<I", image, 28)[0]
     table_end = ph_offset + ph_count * ph_size
-    if header_size < 52 or ph_offset < header_size or ph_size < 32 or table_end > len(image):
-        raise ParseError("KERNEL_INFO ELF program-header table is invalid or truncated")
+    if header_size < 52 or ph_offset < header_size or ph_size < 32:
+        raise ParseError("KERNEL_INFO ELF program-header table is invalid")
+    available_count = min(ph_count, max(0, (len(image) - ph_offset) // ph_size))
+    if table_end > len(image):
+        damaged(
+            "kernel-info-truncated-program-headers",
+            f"KERNEL_INFO program-header table is truncated: {available_count}/{ph_count} entries available",
+            len(image),
+        )
 
     headers = []
-    for index in range(ph_count):
+    limit = len(image)
+
+    def overlaps_headers(offset: int, size: int) -> bool:
+        return offset < header_size or (offset < table_end and offset + size > ph_offset)
+
+    for index in range(available_count):
         values = struct.unpack_from("<8I", image, ph_offset + index * ph_size)
         segment_type, offset, _, _, size, _, _, _ = values
         if not size:
             continue
         if offset + size > len(image):
-            raise ParseError(f"KERNEL_INFO segment {index} is truncated or out of bounds")
-        if offset < header_size or (offset < table_end and offset + size > ph_offset):
-            raise ParseError(f"KERNEL_INFO segment {index} overlaps an ELF header")
+            damaged(
+                "kernel-info-truncated-segment",
+                f"KERNEL_INFO segment {index} is truncated or out of bounds: "
+                f"0x{min(size, max(0, len(image) - offset)):x}/0x{size:x} bytes captured",
+                min(len(image), offset),
+            )
+        if overlaps_headers(offset, size):
+            damaged("kernel-info-header-overlap", f"KERNEL_INFO segment {index} overlaps an ELF header", offset)
+            limit = min(limit, max(header_size, offset))
         if segment_type != 4 and size % 16:
-            raise ParseError(f"KERNEL_INFO segment {index} is not AES-block aligned")
+            damaged("kernel-info-block-alignment", f"KERNEL_INFO segment {index} is not AES-block aligned", offset)
+            limit = min(limit, max(header_size, offset + size // 16 * 16))
         headers.append((segment_type, offset, size))
     previous_end = 0
     for _, offset, size in sorted(headers, key=lambda item: item[1]):
         if offset < previous_end:
-            raise ParseError("KERNEL_INFO segments overlap")
-        previous_end = offset + size
+            damaged("kernel-info-overlapping-segments", "KERNEL_INFO segments overlap; recovering only the unambiguous prefix", offset)
+            limit = min(limit, max(header_size, offset))
+        previous_end = max(previous_end, offset + size)
+
+    for segment_type, offset, size in sorted(headers, key=lambda item: item[1]):
+        if segment_type != 4 and offset < limit and not overlaps_headers(offset, size):
+            available = min(size, limit - offset)
+            if available % 16:
+                limit = offset + available // 16 * 16
 
     key_headers = [header for header in headers if header[0] == 4]
-    if len(key_headers) != 1 or key_headers[0][2] < 0x64:
-        raise ParseError("KERNEL_INFO requires exactly one PT_NOTE with a complete wrapped key at +0x44")
+    key_available = len(key_headers) == 1 and key_headers[0][2] >= 0x64
+    if key_available:
+        key_start, key_end = key_headers[0][1] + 0x44, key_headers[0][1] + 0x64
+        key_available = not overlaps_headers(key_headers[0][1], key_headers[0][2]) and key_end <= len(image) and not any(
+            segment_type != 4 and offset < key_end and offset + size > key_start
+            for segment_type, offset, size in headers
+        )
+    if not key_available:
+        damaged(
+            "kernel-info-missing-key",
+            "KERNEL_INFO requires exactly one PT_NOTE with a complete, unambiguous wrapped key at +0x44; "
+            "preserving metadata without exposing encrypted segments as plaintext",
+        )
+        data_offsets = [offset for segment_type, offset, _ in headers if segment_type != 4]
+        if data_offsets:
+            limit = min(limit, max(header_size, min(data_offsets)))
+        elif ph_offset > len(image):
+            limit = min(header_size, len(image))
+        return bytes(image[:limit])
+
     key_offset = key_headers[0][1] + 0x44
     key = _decrypt_cbc(image[key_offset : key_offset + 0x20], KERNEL_KEK, KERNEL_KEY_IV)
-    result = bytearray(image)
+    result = bytearray(image[:limit])
     for segment_type, offset, size in headers:
-        if segment_type != 4:
-            result[offset : offset + size] = _decrypt_cbc(image[offset : offset + size], key, KERNEL_DATA_IV)
+        if segment_type != 4 and offset < limit and not overlaps_headers(offset, size):
+            captured_size = min(size, limit - offset) // 16 * 16
+            result[offset : offset + captured_size] = _decrypt_cbc(
+                image[offset : offset + captured_size], key, KERNEL_DATA_IV,
+            )
     return bytes(result)

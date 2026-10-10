@@ -285,7 +285,7 @@ def test_malformed_kernel_info_is_rejected(offset, value, message):
     damaged = bytearray(encrypted)
     struct.pack_into("<I", damaged, offset, value)
     with pytest.raises(ParseError, match=message):
-        decrypt_kernel_info(damaged)
+        decrypt_kernel_info(damaged, strict=True)
 
 
 @pytest.mark.parametrize("description", [b"", b"invalid", b"\x7fELF", b"\x01\0\0\0\x7fELF"])

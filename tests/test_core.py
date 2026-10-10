@@ -1,7 +1,9 @@
 import gzip
 import struct
 
-from psp2_core_parse.core import CoreDump
+import pytest
+
+from psp2_core_parse.core import CoreDump, ParseError
 
 
 def make_core(note_name=b"TEST\0", note_type=0x1234, description=b"abcd", load=b"memory"):
@@ -39,3 +41,19 @@ def test_truncated_gzip_salvages_prefix(tmp_path):
     assert core.note("TEST").description == b"abcd"
     assert core.loads[0].data
     assert any(item.code == "truncated-gzip" for item in core.issues)
+
+
+@pytest.mark.parametrize("trailer_offset", [-8, -4])
+def test_corrupt_gzip_trailer_does_not_discard_recovered_elf(tmp_path, trailer_offset):
+    image = make_core()
+    raw = bytearray(gzip.compress(image, mtime=0))
+    raw[trailer_offset] ^= 1
+    path = tmp_path / "damaged.psp2dmp"
+    path.write_bytes(raw)
+    core = CoreDump.read(path)
+    assert core.image == image
+    assert core.note("TEST").description == b"abcd"
+    assert not core.complete
+    assert any(issue.code == "gzip-error" for issue in core.issues)
+    with pytest.raises(ParseError, match="gzip"):
+        CoreDump.read(path, strict=True)

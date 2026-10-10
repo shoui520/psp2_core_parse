@@ -14,7 +14,7 @@ from typing import Iterable, Optional
 
 from . import __version__
 from .analysis import analyze
-from .core import CoreDump, ParseError
+from .core import CoreDump, ParseError, ParseIssue
 from .dump import read_dump
 from .execution import AddressLocation, ExecutionContext, Thread
 from .kernel import KernelObjectRegistry
@@ -270,7 +270,13 @@ def _core(args) -> CoreDump:
         core = read_dump(args.core, strict=args.strict)
     if not isinstance(core, CoreDump):
         raise ParseError(f"{args.command} requires an ELF core")
+    _warn_issues(core.issues)
     return core
+
+
+def _warn_issues(issues: Iterable[ParseIssue]) -> None:
+    for issue in issues:
+        print(f"psp2-core-parse: warning [{issue.code}]: {issue.message}", file=sys.stderr)
 
 
 def _execution(core: CoreDump) -> ExecutionContext:
@@ -1195,6 +1201,7 @@ def command_extract(args) -> tuple[dict, str]:
     core = _core(args)
     if args.blob:
         raise ParseError("extract --blob requires a .psp2kerndmp input")
+    issues = list(core.issues)
     if args.output.exists() and args.output.samefile(core.path):
         raise ParseError("extraction output must not overwrite the input dump")
     if args.output.exists() and not args.force:
@@ -1207,7 +1214,11 @@ def command_extract(args) -> tuple[dict, str]:
         note = core.note("KERNEL_INFO")
         if note is None:
             raise ParseError("KERNEL_INFO was not recovered")
-        data = decrypt_kernel_info(note.description); source = "decrypted KERNEL_INFO ELF"
+        kernel_issues: list[ParseIssue] = []
+        data = decrypt_kernel_info(note.description, strict=args.strict, issues=kernel_issues)
+        _warn_issues(kernel_issues)
+        issues.extend(kernel_issues)
+        source = "decrypted KERNEL_INFO ELF"
     elif args.note is not None:
         note = core.note(args.note)
         if note is None:
@@ -1226,7 +1237,11 @@ def command_extract(args) -> tuple[dict, str]:
         args.output.write_bytes(data)
     except OSError as exc:
         raise ParseError(f"cannot write {args.output}: {exc}") from exc
-    result = {"source": source, "output": str(args.output), "size": len(data)}
+    result = {
+        "source": source, "output": str(args.output), "size": len(data),
+        "complete": not any(issue.severity == "error" for issue in issues),
+        "issues": [issue.summary() for issue in issues],
+    }
     return result, f"Wrote {len(data)} bytes from {source} to {args.output}"
 
 

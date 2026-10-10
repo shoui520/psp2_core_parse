@@ -319,12 +319,17 @@ class CoreDump:
                 )
             )
 
+        header_values = [
+            struct.unpack_from("<8I", image, phoff + index * phentsize)
+            for index in range(available_phnum)
+        ]
+        occupied_ranges = [(0, ehsize), (phoff, phoff + phnum * phentsize)]
+        occupied_ranges.extend((values[1], values[1] + values[4]) for values in header_values if values[4])
         headers: list[ProgramHeader] = []
         notes: list[Note] = []
         loads: list[LoadSegment] = []
-        for index in range(available_phnum):
+        for index, values in enumerate(header_values):
             header_offset = phoff + index * phentsize
-            values = struct.unpack_from("<8I", image, header_offset)
             segment_type, file_offset, vaddr, paddr, file_size, mem_size, seg_flags, seg_align = values
             if file_size == 0:
                 available = 0
@@ -381,8 +386,11 @@ class CoreDump:
                     )
                 )
             elif segment_type == PT_NOTE and available:
-                payload = image[file_offset : file_offset + available]
-                notes.extend(_parse_notes(payload, index, file_offset, file_size, issues))
+                note_size = file_size
+                if available_phnum == phnum:
+                    note_size = _kernel_note_size(image, header, occupied_ranges, issues)
+                payload = image[file_offset : file_offset + note_size]
+                notes.extend(_parse_notes(payload, index, file_offset, note_size, issues))
 
         return cls(
             path=path,
@@ -538,10 +546,24 @@ def _decompress_gzip(raw: bytes, issues: list[ParseIssue]) -> tuple[bytes, bool]
     while cursor < len(raw):
         chunk = raw[cursor : cursor + chunk_size]
         cursor += len(chunk)
+        checkpoint = decoder.copy()
         try:
             output.extend(decoder.decompress(chunk))
         except zlib.error as exc:
             error = exc
+            # A failed zlib call withholds even the valid output preceding the damaged byte.
+            low, high = 0, len(chunk)
+            recovered = b""
+            while low + 1 < high:
+                middle = (low + high) // 2
+                candidate = checkpoint.copy()
+                try:
+                    prefix = candidate.decompress(chunk[:middle])
+                except zlib.error:
+                    high = middle
+                else:
+                    low, recovered = middle, prefix
+            output.extend(recovered)
             break
         if decoder.eof:
             break
@@ -573,6 +595,39 @@ def _decompress_gzip(raw: bytes, issues: list[ParseIssue]) -> tuple[bytes, bool]
             )
         )
     return bytes(output), decoder.eof and error is None
+
+
+def _kernel_note_size(
+    image: bytes,
+    header: ProgramHeader,
+    occupied_ranges: list[tuple[int, int]],
+    issues: list[ParseIssue],
+) -> int:
+    start = header.file_offset
+    if start + 92 > len(image):
+        return header.file_size
+    name_size, description_size, note_type = struct.unpack_from("<3I", image, start)
+    if name_size != 16 or note_type != 0x3000 or image[start + 12 : start + 28] != b"KERNEL_INFO\0\0\0\0\0":
+        return header.file_size
+    version, kernel_size = struct.unpack_from("<QI", image, start + 28)
+    if version != 8 or kernel_size < 52 or description_size != kernel_size + 12:
+        return header.file_size
+    if image[start + 40 : start + 47] != b"\x7fELF\x01\x01\x01":
+        return header.file_size
+    note_size = 28 + description_size
+    if note_size != header.file_size + 8:
+        return header.file_size
+    declared_end, note_end = start + header.file_size, start + note_size
+    if declared_end >= len(image) or any(left < note_end and right > declared_end for left, right in occupied_ranges):
+        return header.file_size
+    # This producer layout omits eight bytes from p_filesz, not from the captured note.
+    issues.append(ParseIssue(
+        "warning", "kernel-info-segment-size",
+        f"KERNEL_INFO PT_NOTE {header.index} understates its note size by 8 bytes; "
+        "using the note's length within unclaimed file data without changing the stored ELF header",
+        declared_end, header.index,
+    ))
+    return note_size
 
 
 def _parse_notes(
