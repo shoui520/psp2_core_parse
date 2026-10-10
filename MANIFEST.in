@@ -1,2 +1,6 @@
+# Copyright (c) 2026 devnoname120
+# SPDX-License-Identifier: MIT
+
 include tests/fixtures/README.md
 include tests/fixtures/*.psp2kerndmp
+include tests/fixtures/*.psp2kerndmp.license

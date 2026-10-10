@@ -1,3 +1,6 @@
+# Copyright (c) 2026 devnoname120
+# SPDX-License-Identifier: MIT
+
 """Development-kit kernel dumps, based on Princess of Sleeping's parser.
 
 Format definitions and decryption parameters:
@@ -225,13 +228,20 @@ class KernelDump:
         return None
 
     def _decode_blob(self) -> None:
-        if len(self.blob) < 4:
-            raise ParseError("truncated .psp2kerndmp blob header")
+        self.trailing = self.blob
+        if self._record(0, 4, "blob header") is None:
+            return
         size = struct.unpack_from("<I", self.blob)[0]
         if size not in (0x38, 0x40):
-            raise ParseError(f"unsupported .psp2kerndmp blob header size 0x{size:x}")
-        if len(self.blob) < size:
-            raise ParseError("truncated .psp2kerndmp blob header")
+            self.issues.append(ParseIssue(
+                "error", "unsupported-kernel-blob-header",
+                f"unsupported .psp2kerndmp blob header size 0x{size:x}; "
+                "preserving container metadata and uninterpreted plaintext",
+                self.info["blob_file_offset"],
+            ))
+            return
+        if self._record(0, size, "blob header") is None:
+            return
         _, pid, tid, cpu, time, file_hash, line_hash, func_hash = struct.unpack_from("<4IQ3I", self.blob)
         counts_offset = 0x24 if size == 0x38 else 0x2C
         kernel_count, user_count, stride, unknown_size, context_flags = struct.unpack_from("<5I", self.blob, counts_offset)
@@ -244,7 +254,13 @@ class KernelDump:
         if size == 0x40:
             self.header.update(zip(("uid_24", "unknown_28"), struct.unpack_from("<2I", self.blob, 0x24)))
         if (kernel_count or user_count) and stride < 0x10:
-            raise ParseError(f"invalid kernel backtrace element stride 0x{stride:x}")
+            self.issues.append(ParseIssue(
+                "error", "invalid-kernel-backtrace-stride",
+                f"invalid kernel backtrace element stride 0x{stride:x}; subsequent records are uninterpreted",
+                self.info["blob_file_offset"] + counts_offset + 8,
+            ))
+            self.trailing = self.blob[size:]
+            return
         offset = used = size
         for name, count, records in (
             ("kernel backtrace", kernel_count, self.kernel_backtrace),
@@ -286,6 +302,7 @@ class KernelDump:
             "raw_file_size": self.raw_file_size, "raw_file_sha256": self.raw_file_sha256,
             "container": self.container, **self.info,
             "available_blob_size": len(self.blob), "blob_sha256": hashlib.sha256(self.blob).hexdigest(),
+            "blob_header_recovered": bool(self.header),
             "issues": [issue.summary() for issue in self.issues],
         }
 
@@ -306,7 +323,9 @@ class KernelDump:
                 entry["sources"].append(source)
         return list(modules.values())
 
-    def thread(self) -> dict:
+    def thread(self) -> Optional[dict]:
+        if not self.header:
+            return None
         context = self.exception_context
         return {
             "index": 0, "uid": self.header["thread_id"], "name": None,
@@ -339,12 +358,21 @@ class KernelDump:
         if context and location is None:
             site = f"pc=0x{context['registers']['pc']:08x}"
         canonical = f"{classification}|fw={self.info['firmware_version']:08x}|{site}"
-        if self.container["type"] == 1:
+        if not self.header:
+            canonical += f"|unparsed-sha256={self.raw_file_sha256}"
+        elif self.container["type"] == 1:
             canonical += "|" + ":".join(f"{self.header[key]:08x}" for key in ("file_hash", "line_hash", "function_hash"))
+        verdict = classification.replace("_", " ").capitalize()
+        verdict += (
+            " recorded in .psp2kerndmp." if self.header else
+            " indicated by container; diagnostic blob header was not recovered."
+        )
         return {
             "dump": self.summary(), "classification": classification,
-            "verdict": classification.replace("_", " ").capitalize() + " recorded in .psp2kerndmp.",
-            "process": {"process_id": self.header["process_id"]}, "primary_crash_thread": self.thread(),
+            "classification_source": "exception-context" if context else "container",
+            "verdict": verdict,
+            "process": {"process_id": self.header["process_id"]} if self.header else None,
+            "primary_crash_thread": self.thread(),
             "failure_bucket": {"canonical": canonical, "sha256": hashlib.sha256(canonical.encode()).hexdigest()},
             "fault": fault,
             "kernel_dump": {

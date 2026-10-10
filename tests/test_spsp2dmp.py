@@ -1,3 +1,6 @@
+# Copyright (c) 2026 devnoname120
+# SPDX-License-Identifier: MIT
+
 import builtins
 import gzip
 import hashlib

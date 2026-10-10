@@ -1,3 +1,7 @@
+# Copyright (c) 2026 psp2_core_parse contributors
+# Copyright (c) 2026 devnoname120
+# SPDX-License-Identifier: MIT
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

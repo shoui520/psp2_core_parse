@@ -1,3 +1,6 @@
+# Copyright (c) 2026 devnoname120
+# SPDX-License-Identifier: MIT
+
 from __future__ import annotations
 
 from pathlib import Path

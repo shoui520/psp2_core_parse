@@ -1,3 +1,6 @@
+# Copyright (c) 2026 devnoname120
+# SPDX-License-Identifier: MIT
+
 """Encrypted Vita system dump support, adapted from Princess-of-Sleeping.
 
 Reference: https://github.com/Princess-of-Sleeping/spsp2dmp-parser

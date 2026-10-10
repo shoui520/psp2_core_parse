@@ -1,3 +1,6 @@
+# Copyright (c) 2026 devnoname120
+# SPDX-License-Identifier: MIT
+
 import builtins
 import gzip
 import json
@@ -196,14 +199,27 @@ def test_truncated_backtraces_do_not_shift_later_records(tmp_path, cut):
     (0x18, 0xFFFFFFFF, "blob"),
     (0x1C, 0, "offset"),
     (0x1C, 0xFFFFFFFF, "offset"),
-    (0x34, 0x39, "header"),
-    (0x34 + 0x2C, 8, "stride"),
 ])
 def test_invalid_container_fields_are_rejected(tmp_path, offset, value, match):
     raw = bytearray(make_dump())
     struct.pack_into("<I", raw, offset, value)
     with pytest.raises(ParseError, match=match):
         read_dump(write_dump(tmp_path, raw))
+
+
+@pytest.mark.parametrize("offset,value,match", [
+    (0x34, 0x39, "header"),
+    (0x34 + 0x2C, 8, "stride"),
+])
+def test_invalid_blob_fields_are_salvaged_unless_strict(tmp_path, offset, value, match):
+    raw = bytearray(make_dump())
+    struct.pack_into("<I", raw, offset, value)
+    path = write_dump(tmp_path, raw)
+    dump = read_dump(path)
+    assert not dump.complete
+    assert dump.blob == raw[0x34:]
+    with pytest.raises(ParseError, match=match):
+        read_dump(path, strict=True)
 
 
 def test_huge_backtrace_counts_are_bounded_by_available_bytes(tmp_path):

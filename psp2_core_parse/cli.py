@@ -1,3 +1,7 @@
+# Copyright (c) 2026 psp2_core_parse contributors
+# Copyright (c) 2026 devnoname120
+# SPDX-License-Identifier: MIT
+
 from __future__ import annotations
 
 import argparse

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 devnoname120
+# SPDX-License-Identifier: MIT
+
 from __future__ import annotations
 
 import json
@@ -38,16 +41,22 @@ def _backtrace_lines(dump: KernelDump) -> list[str]:
 
 
 def _info_lines(dump: KernelDump) -> list[str]:
-    return [
+    lines = [
         str(dump.path),
         f"PS Vita kernel dump: {'complete' if dump.complete else 'SALVAGED'}",
         f"Firmware: {dump.info['firmware_version_string']}; type={dump.container['type']}",
         f"Input: {dump.raw_file_size} bytes; blob: {len(dump.blob)}/{dump.info['blob_size']} bytes; encrypted={dump.info['encrypted']}",
-        f"PID=0x{dump.header['process_id']:08x} TID=0x{dump.header['thread_id']:08x} CPU={dump.header['cpu_id']}",
-        f"System time: {dump.header['system_time_us']} microseconds",
-        f"Source hashes: file=0x{dump.header['file_hash']:08x} line=0x{dump.header['line_hash']:08x} function=0x{dump.header['function_hash']:08x}",
-        f"SHA-256: {dump.raw_file_sha256}",
     ]
+    if dump.header:
+        lines += [
+            f"PID=0x{dump.header['process_id']:08x} TID=0x{dump.header['thread_id']:08x} CPU={dump.header['cpu_id']}",
+            f"System time: {dump.header['system_time_us']} microseconds",
+            f"Source hashes: file=0x{dump.header['file_hash']:08x} line=0x{dump.header['line_hash']:08x} function=0x{dump.header['function_hash']:08x}",
+        ]
+    else:
+        lines.append("Diagnostic blob header: not recovered; thread/register details unavailable.")
+    lines.append(f"SHA-256: {dump.raw_file_sha256}")
+    return lines
 
 
 def _analysis_text(dump: KernelDump, result: dict) -> str:
@@ -73,7 +82,8 @@ def _analysis_text(dump: KernelDump, result: dict) -> str:
     if dump.saved_thread_registers:
         lines += ["", "Saved thread registers:"] + _register_lines(dump.saved_thread_registers)
     if dump.trailing:
-        lines.append(f"Uninterpreted trailing blob bytes: {len(dump.trailing)} (preserved by extract --blob and JSON)")
+        label = "trailing blob" if dump.header else "blob"
+        lines.append(f"Uninterpreted {label} bytes: {len(dump.trailing)} (preserved by extract --blob and JSON)")
     lines.extend(f"{issue.severity}: {issue.message}" for issue in dump.issues)
     lines += ["", "Limitations:"] + result["limitations"]
     return "\n".join(lines)
@@ -88,6 +98,8 @@ def command_kernel_dump(args, dump: KernelDump) -> tuple[object, str]:
     if command in ("thread", "registers", "backtrace"):
         selector = getattr(args, "selector", "crash")
         if selector != "crash":
+            if not dump.header:
+                raise ParseError("no thread record was recovered from the kernel dump")
             try:
                 selected = int(selector, 0) in (0, dump.header["thread_id"])
             except ValueError:
@@ -101,6 +113,10 @@ def command_kernel_dump(args, dump: KernelDump) -> tuple[object, str]:
         return dump.summary(), "\n".join(_info_lines(dump) + [f"{issue.severity}: {issue.message}" for issue in dump.issues])
     if command in ("threads", "thread"):
         thread = dump.thread()
+        if thread is None:
+            if command == "thread":
+                raise ParseError("no thread record was recovered from the kernel dump")
+            return {"threads": [], "complete_inventory": False}, "No thread record was recovered from the kernel dump."
         result = {"threads": [thread], "complete_inventory": False} if command == "threads" else thread
         return result, f"Captured thread: TID=0x{thread['uid']:08x} PID=0x{thread['process_id']:08x} CPU={thread['cpu_id']}"
     if command == "registers":
@@ -130,6 +146,7 @@ def command_kernel_dump(args, dump: KernelDump) -> tuple[object, str]:
     if command == "validate":
         result = {
             "format": "psp2kerndmp", "valid_core": dump.complete,
+            "blob_header_recovered": bool(dump.header),
             "core_issues": [issue.summary() for issue in dump.issues],
             "kernel_backtrace_count": len(dump.kernel_backtrace), "user_backtrace_count": len(dump.user_backtrace),
             "exception_context_recovered": dump.exception_context is not None,
@@ -147,5 +164,10 @@ def command_kernel_dump(args, dump: KernelDump) -> tuple[object, str]:
         raise ParseError(f"{args.output} exists; use --force to overwrite it")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(dump.blob)
-    result = {"source": "kernel dump plaintext blob", "output": str(args.output), "size": len(dump.blob)}
-    return result, f"Wrote {len(dump.blob)} plaintext blob bytes to {args.output}"
+    result = {
+        "source": "kernel dump plaintext blob", "output": str(args.output), "size": len(dump.blob),
+        "complete": dump.complete, "issues": [issue.summary() for issue in dump.issues],
+    }
+    lines = [f"Wrote {len(dump.blob)} plaintext blob bytes to {args.output}"]
+    lines.extend(f"{issue.severity}: {issue.message}" for issue in dump.issues)
+    return result, "\n".join(lines)
