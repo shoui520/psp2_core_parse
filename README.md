@@ -134,6 +134,9 @@ Extract raw evidence:
 ./psp2-core-parse extract dump.psp2dmp --load 3 --output load.bin
 ./psp2-core-parse extract dump.psp2dmp \
   --memory 0x81000000 0x100 --output memory.bin
+./psp2-core-parse extract dump.spsp2dmp --elf --output outer.elf
+./psp2-core-parse extract dump.spsp2dmp --kernel-info --output kernel.elf
+./psp2-core-parse extract dump.psp2kerndmp --blob --output payload.bin
 ./psp2-core-parse system2 dump.psp2dmp --output display.caf
 ```
 
@@ -146,7 +149,7 @@ Triage and compare multiple dumps:
 ./psp2-core-parse compare first.psp2dmp second.psp2dmp --json
 ```
 
-Add `--json` to query commands for machine-readable output. Add `--strict` to reject structurally incomplete dumps.
+Add `--json` for machine-readable output. Incomplete dumps are recovered where possible, with warnings; use `--strict` to reject them. Kernel blob extraction preserves available plaintext even when crash records cannot be decoded. Decrypted output is not authenticated.
 
 ## Credits
 
