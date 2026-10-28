@@ -22,6 +22,7 @@ from test_core import make_core
 
 # Format/key reference: Princess-of-Sleeping/spsp2dmp-parser, MIT (see LICENSE).
 CONTAINER_KEY = bytes.fromhex("c815c36ff2f89564a2f7ae13cb6d47ac")
+CONTAINER_KEYS = {1: bytes.fromhex("53c25972bb6037d92ddd006f212e0add"), 2: CONTAINER_KEY}
 CONTAINER_IV = bytes(range(16))
 
 
@@ -31,7 +32,7 @@ def encrypt(data, key=CONTAINER_KEY, iv=CONTAINER_IV):
 
 
 def make_container(image=None, *, payload=None, header_size=0x130, reverse=False,
-                   padded_length=False):
+                   padded_length=False, key_id=2):
     if payload is None:
         payload = gzip.compress(make_core() if image is None else image, mtime=0)
     logical_size = len(payload)
@@ -40,13 +41,14 @@ def make_container(image=None, *, payload=None, header_size=0x130, reverse=False
     header = bytearray(header_size)
     struct.pack_into("<8s5Q", header, 0, b"\0\0FACECS", 2, 1, 2,
                      header_size, len(payload) + len(auxiliary))
-    sections = [(0, header_size, len(payload) if padded_length else logical_size, 1, 2, CONTAINER_IV, 0),
-                (1, header_size + len(payload), len(auxiliary), 1, 2, CONTAINER_IV, 0)]
+    sections = [(0, header_size, len(payload) if padded_length else logical_size, 1, key_id, CONTAINER_IV, 0),
+                (1, header_size + len(payload), len(auxiliary), 1, key_id, CONTAINER_IV, 0)]
     if reverse:
         sections.reverse()
     for index, section in enumerate(sections):
         struct.pack_into("<5Q16sQ", header, 0x30 + 0x40 * index, *section)
-    return bytes(header) + encrypt(payload) + encrypt(auxiliary)
+    key = CONTAINER_KEYS[key_id]
+    return bytes(header) + encrypt(payload, key) + encrypt(auxiliary, key)
 
 
 def write_dump(tmp_path, raw, suffix=".spsp2dmp"):
@@ -85,6 +87,13 @@ def test_read_dump_routes_encrypted_system_dump_by_magic(tmp_path, capsys, suffi
     assert dump.image == make_core()
     assert main(["info", str(path), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["encrypted"] is True
+
+
+@pytest.mark.parametrize("key_id", [1, 2])
+def test_encryption_key_id_selects_container_key(tmp_path, key_id):
+    core = CoreDump.read(write_dump(tmp_path, make_container(key_id=key_id)), strict=True)
+    assert core.image == make_core()
+    assert core.encryption["sections"][0]["encryption_key_id"] == key_id
 
 
 @pytest.mark.parametrize("reverse", [False, True])

@@ -19,8 +19,12 @@ from .core import ParseError, ParseIssue
 MAGIC = b"\0\0FACECS"
 HEADER = struct.Struct("<8s5Q")
 SECTION = struct.Struct("<5Q16sQ")
-# The reference selects AES-128, despite storing a 32-byte outer key array.
-CONTAINER_KEY = bytes.fromhex("c815c36ff2f89564a2f7ae13cb6d47ac")
+# SceCoredump fetches the section key by its key ID from SceSblPostSsMgr's
+# retail CFK1 table (0x10-byte keys at +0x80); key ID 2 matches the reference.
+CONTAINER_KEYS = {
+    1: bytes.fromhex("53c25972bb6037d92ddd006f212e0add"),
+    2: bytes.fromhex("c815c36ff2f89564a2f7ae13cb6d47ac"),
+}
 KERNEL_KEK = bytes.fromhex("845c655b503b54717add4999436b5b5b")
 KERNEL_KEY_IV = bytes.fromhex("08090a0c0c0d0e0f0001020304050607")
 KERNEL_DATA_IV = bytes.fromhex("0be6477340c4460fdbb9c02db13ce964")
@@ -101,13 +105,14 @@ def decrypt_container(raw: bytes, issues: list[ParseIssue]) -> tuple[bytes, dict
     if core_section is None:
         raise ParseError("SPSP2DMP coredump section 0 is missing")
     section, iv = core_section
-    if section["encryption_key_id"] != 2:
+    key = CONTAINER_KEYS.get(section["encryption_key_id"])
+    if key is None:
         raise ParseError(f"unsupported SPSP2DMP encryption key ID {section['encryption_key_id']}")
     captured_size = section["available_encrypted_size"] // 16 * 16
     if not captured_size:
         raise ParseError("SPSP2DMP coredump section 0 has no complete AES block")
     start = section["file_offset"]
-    payload = _decrypt_cbc(raw[start : start + captured_size], CONTAINER_KEY, iv)
+    payload = _decrypt_cbc(raw[start : start + captured_size], key, iv)
     payload = payload[:section["size"]]
     if not payload.startswith(b"\x1f\x8b"):
         raise ParseError("decrypted SPSP2DMP coredump section 0 does not begin with gzip data")
