@@ -9,6 +9,7 @@ import difflib
 import json
 import struct
 import sys
+import zlib
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -20,6 +21,7 @@ from .execution import AddressLocation, ExecutionContext, Thread
 from .kernel import KernelObjectRegistry
 from .kerndump import KernelDump
 from .kerndump_cli import command_kernel_dump
+from .spsp2dmp import describe_hmac, format_key_id, screenshot_frames
 from .support import decode_note, parse_memory_blocks, supporting_context
 from .symbols import SourcePathMap, Symbolizer, ToolError, disassemble_address
 from .tty import TtyInfo
@@ -181,9 +183,10 @@ def build_parser() -> argparse.ArgumentParser:
     item = commands.add_parser("context", help="show system, build, application, and producer context")
     _add_core_arguments(item)
 
-    item = commands.add_parser("system2", help="inspect or extract the SCECAF display-surface container")
+    item = commands.add_parser("system2", help="inspect, decrypt, or extract the SYSTEM_INFO2 screenshot container")
     _add_core_arguments(item)
     item.add_argument("--output", type=Path, help="write the raw SCECAF container (without note version word)")
+    item.add_argument("--frames", type=Path, metavar="DIR", help="write each recovered frame as a PNG (process.png, shell.png)")
     item.add_argument("--force", action="store_true")
 
     item = commands.add_parser("map", help="show captured PT_LOAD memory ranges")
@@ -393,7 +396,12 @@ def command_info(args) -> tuple[dict, str]:
         f"SHA-256: {core.raw_file_sha256}",
     ))
     if core.encryption is not None:
-        text += f"\nEncryption: {core.encryption['cipher']} (SPSP2DMP); HMACs: unverified"
+        encryption = core.encryption
+        key_id = next(item["encryption_key_id"] for item in encryption["sections"] if item["id"] == 0)
+        text += (
+            f"\nEncryption: {encryption['cipher']} (SPSP2DMP, {encryption['key_set']} key ID "
+            f"{format_key_id(key_id)}); HMACs: {describe_hmac(encryption)}"
+        )
     return result, text
 
 
@@ -808,8 +816,72 @@ def command_context(args) -> tuple[dict, str]:
                 f"GPU activity producer record: {'empty' if data['empty'] else str(data['payload_size']) + ' bytes'}"
             )
         else:
-            lines.append(f"{name}: version={data.get('format_version')} size={data.get('raw_size', len(note.description))}")
+            line = f"{name}: version={data.get('format_version')} size={data.get('raw_size', len(note.description))}"
+            if data.get("open_psid"):
+                line += f"; OpenPSID: {data['open_psid']}"
+                if data["open_psid_verified"] is not None:
+                    line += "; encrypted copy " + ("matches" if data["open_psid_verified"] else "differs")
+            elif data.get("decrypted_open_psid"):
+                line += f"; OpenPSID: {data['decrypted_open_psid']} (decrypted, {data['open_psid_key_set']} keys)"
+            lines.append(line)
     return result, "\n".join(lines)
+
+
+def _frame_text(frame: dict) -> str:
+    if frame["width"] is None:
+        state = "not captured" if frame["available_section_size"] < 16 else "not decrypted"
+        return f"{state}; HMAC {frame['hmac']}"
+    if not frame["width"]:
+        return f"no framebuffer; HMAC {frame['hmac']}"
+    rows = frame["pixel_bytes"] // (frame["width"] * 4)
+    text = f"{frame['width']}x{frame['height']} pixel format 0x{frame['pixel_format']:x}"
+    if not frame["complete"]:
+        text += f", {rows}/{frame['height']} rows recovered"
+    return f"{text}; HMAC {frame['hmac']}"
+
+
+def _png(width: int, height: int, pixels: bytes) -> bytes:
+    """Encode A8B8G8R8 framebuffer rows as an RGB PNG; the display ignores alpha."""
+    rgb = bytearray(width * height * 3)
+    for channel in range(3):
+        rgb[channel::3] = pixels[channel : width * height * 4 : 4]
+    stride = width * 3
+    rows = b"".join(b"\0" + bytes(rgb[row * stride : (row + 1) * stride]) for row in range(height))
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload))
+
+    header = struct.pack(">2I5B", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+
+
+def _write_frames(description: bytes, data: dict, directory: Path, force: bool) -> list[str]:
+    if data["decryption_error"]:
+        raise ParseError(data["decryption_error"])
+    _, pixels = screenshot_frames(description)
+    outputs = []
+    for frame, frame_pixels in zip(data["frames"], pixels):
+        if not frame["width"] or len(frame_pixels) < frame["width"] * 4:
+            continue
+        if frame["pixel_format"] != 0:
+            raise ParseError(f"frame {frame['index']} pixel format 0x{frame['pixel_format']:x} cannot be written as PNG")
+        path = directory / f"{frame['source'] or 'frame' + str(frame['index'])}.png"
+        if path.exists() and not force:
+            raise ParseError(f"{path} exists; use --force to overwrite it")
+        outputs.append((path, frame, frame_pixels))
+    if not outputs:
+        return ["No recovered frame pixels to write"]
+    lines = []
+    for path, frame, frame_pixels in outputs:
+        rows = len(frame_pixels) // (frame["width"] * 4)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(_png(frame["width"], rows, frame_pixels))
+        except OSError as exc:
+            raise ParseError(f"cannot write {path}: {exc}") from exc
+        suffix = "" if rows == frame["height"] else f" ({rows}/{frame['height']} rows)"
+        lines.append(f"Wrote {path}{suffix}")
+    return lines
 
 
 def command_system2(args) -> tuple[dict, str]:
@@ -820,11 +892,17 @@ def command_system2(args) -> tuple[dict, str]:
     data = _decoded_note_data(core, "SYSTEM_INFO2")
     result = dict(data)
     lines = [
-        f"Container: {data['container_magic_le64']} ({'valid' if data['container_magic_valid'] else 'unexpected'} magic)",
-        f"Header: 0x{data['declared_header_size']:x}; payload: {_size(data['payload_size'])}; raw note: {_size(data['raw_size'])}",
-        f"Producer surface count word: {data['producer_surface_count_word']}",
-        "Qualification: SceCoredump emits this SCECAF container from display surfaces; payload encoding is retained, not guessed.",
+        f"Container: SCECAF, {len(data['frames'])} section(s); raw note: {_size(data['raw_size'])}"
+        + ("" if data["complete"] else " (incomplete)"),
+        f"HMACs: {describe_hmac(data)}",
     ]
+    for frame in data["frames"]:
+        lines.append(f"Frame {frame['index']} ({frame['source'] or 'unknown'}): {_frame_text(frame)}")
+    if data["decryption_error"]:
+        lines.append(f"Decryption: {data['decryption_error']}")
+    if args.frames is not None:
+        lines.extend(_write_frames(note.description, data, args.frames, args.force))
+        result["frames_output"] = str(args.frames)
     if args.output is not None:
         if args.output.exists() and not args.force:
             raise ParseError(f"{args.output} exists; use --force to overwrite it")

@@ -5,7 +5,7 @@ Analyze a PlayStation Vita psp2core dump:
 ```sh
 ./psp2-core-parse analyze dump.psp2dmp
 ```
-For encrypted `.spsp2dmp` dumps, install:
+For encrypted `.spsp2dmp` dumps and the screenshot in every dump, install:
 ```sh
 python -m pip install '.[crypto]'
 ```
@@ -63,7 +63,7 @@ Other basic commands:
 ./psp2-core-parse devices dump.psp2dmp
 ./psp2-core-parse summary dump.psp2dmp
 ./psp2-core-parse context dump.psp2dmp
-./psp2-core-parse system2 dump.psp2dmp --output display.caf
+./psp2-core-parse system2 dump.psp2dmp --frames screenshots/
 ./psp2-core-parse map dump.psp2dmp
 ./psp2-core-parse address dump.psp2dmp 0x81000000 --image application=application.elf
 ./psp2-core-parse memory dump.psp2dmp 0x81000000 0x40
@@ -149,7 +149,7 @@ Triage and compare multiple dumps:
 ./psp2-core-parse compare first.psp2dmp second.psp2dmp --json
 ```
 
-Add `--json` for machine-readable output. Incomplete dumps are recovered where possible, with warnings; use `--strict` to reject them. Kernel blob extraction preserves available plaintext even when crash records cannot be decoded. Decrypted output is not authenticated.
+Add `--json` for machine-readable output. Incomplete dumps are recovered where possible, with warnings; use `--strict` to reject them. Kernel blob extraction preserves available plaintext even when crash records cannot be decoded. SPSP2DMP containers and `SYSTEM_INFO2` screenshots are checked against their HMACs, and a mismatch is an error. Decrypted kernel dump output is not authenticated.
 
 ## Credits
 

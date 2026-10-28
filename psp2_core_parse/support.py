@@ -11,6 +11,7 @@ from .core import CoreDump, Note, ParseError
 from .execution import ExecutionContext
 from .kernel import PARSERS as KERNEL_PARSERS
 from .metadata import SummaryInfo
+from .spsp2dmp import decode_open_psid, screenshot_frames
 from .tty import TtyInfo
 
 
@@ -69,13 +70,16 @@ def decode_corefile(data: bytes) -> dict:
 def decode_system(data: bytes) -> dict:
     if len(data) < 0x14:
         raise ParseError("SYSTEM_INFO is truncated")
-    return {
+    result = {
         "format_version": u32(data, 0),
         "capture_status": u32(data, 4),
         "software_version_words": [u32(data, 8), u32(data, 0x10)],
         "raw_words": list(words(data)),
         "raw_size": len(data),
     }
+    if len(data) >= 0x48:
+        result.update(decode_open_psid(data[0x18:0x28], data[0x38:0x48]))
+    return result
 
 
 def decode_application(data: bytes) -> dict:
@@ -354,30 +358,9 @@ def decode_system_devices(data: bytes) -> dict:
 
 
 def decode_system2(data: bytes) -> dict:
-    if len(data) < 0x30:
-        raise ParseError("SYSTEM_INFO2 is truncated")
-    header_size = u32(data, 0x24)
-    valid_header = 0x30 <= header_size <= len(data) and not header_size % 4
-    payload_start = header_size if valid_header else min(len(data), 0x30)
-    payload = data[payload_start:]
-    magic_bytes = data[4:12]
-    return {
-        "format_version": u32(data, 0),
-        "complete": valid_header,
-        "container_magic_bytes": magic_bytes.hex(),
-        "container_magic_le64": magic_bytes[::-1].rstrip(b"\x00").decode("ascii", errors="replace"),
-        "container_magic_valid": magic_bytes == b"\x00\x00FACECS",
-        "declared_header_size": header_size,
-        "header_size_valid": valid_header,
-        "header_words": list(words(data, 0, payload_start)),
-        "header_sha256": _hash(data[:payload_start]),
-        "payload_size": len(payload),
-        "payload_sha256": _hash(payload),
-        "payload_nonzero_bytes": sum(value != 0 for value in payload),
-        "expected_single_rgba_surface_bytes": 960 * 544 * 4,
-        "producer_surface_count_word": u32(data, 0x1C),
-        "raw_size": len(data),
-    }
+    result, _ = screenshot_frames(data)
+    result.update(_trailing(data, result["container_end"]))
+    return result
 
 
 def decode_libraries(data: bytes) -> dict:

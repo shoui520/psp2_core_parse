@@ -7,6 +7,8 @@ from __future__ import annotations
 import shlex
 from typing import Optional
 
+from .spsp2dmp import describe_hmac, format_key_id
+
 
 ANALYSIS_BANNER = """*******************************************************************************
 *                                                                             *
@@ -84,8 +86,18 @@ def render_analysis_report(result: dict) -> str:
     lines.append(f"    {container['path']}")
     _heading(lines, "DUMP_FILE_ATTRIBUTES")
     if container.get("encrypted"):
-        _field(lines, "Encryption", container["encryption"]["cipher"])
-        _field(lines, "HMAC verification", "not performed")
+        encryption = container["encryption"]
+        key_id = next(item["encryption_key_id"] for item in encryption["sections"] if item["id"] == 0)
+        _field(lines, "Encryption", f"{encryption['cipher']} ({encryption['key_set']} key ID {format_key_id(key_id)})")
+        _field(lines, "HMAC verification", describe_hmac(encryption))
+        access = encryption.get("access_parameters")
+        if access:
+            _field(
+                lines,
+                "Access parameters",
+                f"stop={_hex(access['stop_reason'])} pc={_hex(access['pc'])} lr={_hex(access['lr'])} "
+                f"system={_hex(access['system_version'])}",
+            )
     _field(lines, "Compression", "gzip" if container["compressed"] else "none")
     _field(lines, "Compression complete", str(container["compression_complete"]).lower())
     _field(lines, "ELF class / machine", f"ELF32 / {container['machine']}")
@@ -183,14 +195,19 @@ def render_analysis_report(result: dict) -> str:
             )
         _field(lines, "Metadata planned padding", f"0x{metadata['trailing_size']:x}; nonzero={metadata['trailing_nonzero_bytes']}")
     if system2:
-        _field(
-            lines,
-            "SYSTEM_INFO2 SCECAF",
-            f"magic={system2['container_magic_le64']} header=0x{system2['declared_header_size']:x} "
-            f"payload=0x{system2['payload_size']:x}",
-        )
-        _field(lines, "SCECAF surface count word", system2["producer_surface_count_word"])
-        _field(lines, "SCECAF payload SHA-256", system2["payload_sha256"])
+        frames = []
+        for frame in system2["frames"]:
+            if frame["width"] is None:
+                state = "not captured" if frame["available_section_size"] < 16 else "not decrypted"
+            elif not frame["width"]:
+                state = "none"
+            else:
+                state = f"{frame['width']}x{frame['height']}" + ("" if frame["complete"] else " (partial)")
+            frames.append(f"{frame['source'] or frame['index']}={state}")
+        _field(lines, "Screenshot (SYSTEM_INFO2)", ", ".join(frames) or "no sections")
+        _field(lines, "Screenshot HMAC", describe_hmac(system2))
+        if system2["decryption_error"]:
+            _field(lines, "Screenshot decryption", system2["decryption_error"])
     if gpu_activity:
         _field(
             lines,
