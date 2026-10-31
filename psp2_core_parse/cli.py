@@ -15,13 +15,14 @@ from typing import Iterable, Optional
 
 from . import __version__
 from .analysis import analyze
+from .caf import CafFile
 from .core import CoreDump, ParseError, ParseIssue
 from .dump import read_dump
 from .execution import AddressLocation, ExecutionContext, Thread
 from .kernel import KernelObjectRegistry
 from .kerndump import KernelDump
 from .kerndump_cli import command_kernel_dump
-from .spsp2dmp import describe_hmac, format_key_id, screenshot_frames
+from .spsp2dmp import describe_hmac, format_key_id, is_gzip, open_caf, screenshot_frames
 from .support import decode_note, parse_memory_blocks, supporting_context
 from .symbols import SourcePathMap, Symbolizer, ToolError, disassemble_address
 from .tty import TtyInfo
@@ -185,7 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     item = commands.add_parser("system2", help="inspect, decrypt, or extract the SYSTEM_INFO2 screenshot container")
     _add_core_arguments(item)
-    item.add_argument("--output", type=Path, help="write the raw SCECAF container (without note version word)")
+    item.add_argument("--output", type=Path, help="write the SCECAF container as a standalone .caf (without note version word or padding)")
     item.add_argument("--frames", type=Path, metavar="DIR", help="write each recovered frame as a PNG (process.png, shell.png)")
     item.add_argument("--force", action="store_true")
 
@@ -262,6 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--load", type=int, metavar="PROGRAM_HEADER_INDEX")
     source.add_argument("--memory", nargs=2, type=integer, metavar=("ADDRESS", "SIZE"))
     source.add_argument("--blob", action="store_true", help="extract a .psp2kerndmp plaintext blob")
+    source.add_argument("--section", type=int, metavar="ID", help="write a decrypted .spsp2dmp or .caf section")
     item.add_argument("--output", required=True, type=Path)
     item.add_argument("--force", action="store_true")
     return parser
@@ -855,10 +857,9 @@ def _png(width: int, height: int, pixels: bytes) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
 
 
-def _write_frames(description: bytes, data: dict, directory: Path, force: bool) -> list[str]:
+def _write_frames(data: dict, pixels: list[bytes], directory: Path, force: bool) -> list[str]:
     if data["decryption_error"]:
         raise ParseError(data["decryption_error"])
-    _, pixels = screenshot_frames(description)
     outputs = []
     for frame, frame_pixels in zip(data["frames"], pixels):
         if not frame["width"] or len(frame_pixels) < frame["width"] * 4:
@@ -901,12 +902,12 @@ def command_system2(args) -> tuple[dict, str]:
     if data["decryption_error"]:
         lines.append(f"Decryption: {data['decryption_error']}")
     if args.frames is not None:
-        lines.extend(_write_frames(note.description, data, args.frames, args.force))
+        lines.extend(_write_frames(data, screenshot_frames(note.description)[1], args.frames, args.force))
         result["frames_output"] = str(args.frames)
     if args.output is not None:
         if args.output.exists() and not args.force:
             raise ParseError(f"{args.output} exists; use --force to overwrite it")
-        payload = note.description[4:]
+        payload = note.description[4 : data["container_end"]]
         try:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_bytes(payload)
@@ -1206,6 +1207,8 @@ def _analyze_path(path: Path, *, strict: bool = False) -> dict:
     core = read_dump(path, strict=strict)
     if isinstance(core, KernelDump):
         return core.analysis()
+    if isinstance(core, CafFile):
+        raise ParseError(f"{core.kind.replace('-', ' ')} CAF holds no crash data")
     return analyze(core, tty_lines=0, stack_candidates=0)
 
 
@@ -1275,6 +1278,82 @@ def command_compare(args) -> tuple[dict, str]:
     return result, text or "No selected diagnostic differences."
 
 
+def _caf_section(container: dict, sections: list[Optional[bytes]], section_id: int) -> bytes:
+    for item, plaintext in zip(container["sections"], sections):
+        if item["id"] == section_id:
+            if plaintext is None:
+                raise ParseError(container["decryption_error"] or f"section {section_id} has no captured AES block")
+            return plaintext
+    raise ParseError(f"section {section_id} was not found")
+
+
+_CAF_COMMANDS = {"analyze", "info", "context", "validate", "system2", "extract"}
+
+
+def _caf_lines(caf: CafFile) -> list[str]:
+    container = caf.container
+    label = "crash report" if caf.kind == "crash-report" else "screenshot container"
+    lines = [str(caf.path), f"SceCoredump {label} (CAF): {'complete' if caf.complete else 'SALVAGED'}"]
+    report = caf.crash_report
+    if report:
+        lines.append(f"Dump file: {report['corefile_path']}" + ("" if report["corefile_path_complete"] else " (truncated)"))
+        title_id = report["title_id"] if report["corefile_path_complete"] else None
+        lines.append(f"Title ID: {title_id or 'unavailable'}" + ("" if not title_id or report["title_id_complete"] else " (truncated)"))
+    for frame in caf.screenshot["frames"] if caf.screenshot else []:
+        lines.append(f"Frame {frame['index']} ({frame['source'] or 'unknown'}): {_frame_text(frame)}")
+    key_ids = ", ".join(format_key_id(value) for value in sorted({item["encryption_key_id"] for item in container["sections"]}))
+    lines.append(f"Encryption: {container['cipher']} ({container['key_set']} key ID {key_ids}); HMACs: {describe_hmac(container)}")
+    if container["decryption_error"]:
+        lines.append(f"Decryption: {container['decryption_error']}")
+    lines.append(f"SHA-256: {caf.raw_file_sha256}")
+    return lines
+
+
+def command_caf(args, caf: CafFile) -> tuple[object, str]:
+    command = args.command
+    kind = caf.kind.replace("-", " ")
+    if command not in _CAF_COMMANDS or (command == "system2" and caf.kind != "screenshot"):
+        raise ParseError(f"{command} is not available for a {kind} CAF; it has no ELF notes or captured memory")
+    _warn_issues(caf.issues)
+    if command in ("analyze", "info", "context"):
+        lines = _caf_lines(caf)
+        if command == "analyze" and caf.crash_report and caf.crash_report["corefile_path_complete"]:
+            lines.append(f"A crash report holds no crash data; analyze {caf.crash_report['corefile_name']} instead.")
+        return caf.summary(), "\n".join(lines)
+    if command == "validate":
+        result = {
+            "format": "caf", "kind": caf.kind, "valid": caf.complete and caf.container["hmac_verified"],
+            "complete": caf.complete, "hmac_verified": caf.container["hmac_verified"],
+            "issues": [issue.summary() for issue in caf.issues],
+        }
+        lines = [f"{kind.capitalize()} CAF: {'complete' if caf.complete else 'salvaged'}; HMACs: {describe_hmac(caf.container)}"]
+        lines.extend(f"{issue.severity}: {issue.message}" for issue in caf.issues)
+        return result, "\n".join(lines)
+    if command == "system2":
+        if args.output is not None:
+            raise ParseError("the input is already a standalone SCECAF container")
+        result = dict(caf.screenshot)
+        lines = _caf_lines(caf)
+        if args.frames is not None:
+            lines.extend(_write_frames(caf.screenshot, caf.pixels, args.frames, args.force))
+            result["frames_output"] = str(args.frames)
+        return result, "\n".join(lines)
+    if args.section is None:
+        raise ParseError("CAF files have no ELF image, notes, or captured memory; use extract --section ID")
+    if args.output.exists() and args.output.samefile(caf.path):
+        raise ParseError("extraction output must not overwrite the input dump")
+    if args.output.exists() and not args.force:
+        raise ParseError(f"{args.output} exists; use --force to overwrite it")
+    data = _caf_section(caf.container, caf.sections, args.section)
+    try:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_bytes(data)
+    except OSError as exc:
+        raise ParseError(f"cannot write {args.output}: {exc}") from exc
+    result = {"source": f"decrypted CAF section {args.section}", "output": str(args.output), "size": len(data)}
+    return result, f"Wrote {len(data)} bytes of decrypted CAF section {args.section} to {args.output}"
+
+
 def command_extract(args) -> tuple[dict, str]:
     core = _core(args)
     if args.blob:
@@ -1302,6 +1381,11 @@ def command_extract(args) -> tuple[dict, str]:
         if note is None:
             raise ParseError(f"note {args.note!r} was not found")
         data = note.description; source = f"note {args.note}"
+    elif args.section is not None:
+        if core.encryption is None:
+            raise ParseError("extract --section requires an encrypted .spsp2dmp or .caf input")
+        container, sections = open_caf(core.path.read_bytes(), [], label="SPSP2DMP", probe=is_gzip)
+        data = _caf_section(container, sections, args.section); source = f"decrypted SPSP2DMP section {args.section}"
     elif args.load is not None:
         matches = [item for item in core.loads if item.index == args.load]
         if not matches:
@@ -1348,6 +1432,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             args._loaded_core = read_dump(args.core, strict=args.strict)
         if isinstance(getattr(args, "_loaded_core", None), KernelDump):
             result, text = command_kernel_dump(args, args._loaded_core)
+        elif isinstance(getattr(args, "_loaded_core", None), CafFile):
+            result, text = command_caf(args, args._loaded_core)
         else:
             result, text = COMMANDS[args.command](args)
     except (ParseError, ToolError, OSError, struct.error, ValueError) as exc:

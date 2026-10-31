@@ -13,7 +13,7 @@ import hashlib
 import hmac
 import struct
 import warnings
-from typing import Optional
+from typing import Callable, Optional
 
 from .core import ParseError, ParseIssue, _decompress_gzip
 
@@ -171,8 +171,10 @@ def _section_hmac(raw: bytes, section: dict, key_set: str) -> str:
     return "verified" if hmac.compare_digest(digest, section["digest"]) else "mismatch"
 
 
-def _decrypt_section(raw: bytes, section: dict, key_set: str) -> bytes:
+def _decrypt_section(raw: bytes, section: dict, key_set: str, limit: Optional[int] = None) -> bytes:
     captured_size = section["available_encrypted_size"] // 16 * 16
+    if limit is not None:
+        captured_size = min(captured_size, limit)
     start = section["file_offset"]
     key = KEY_SETS[key_set]["cipher"][section["encryption_key_id"]]
     return _decrypt_cbc(raw[start : start + captured_size], key, section["iv"])[:section["size"]]
@@ -180,6 +182,111 @@ def _decrypt_section(raw: bytes, section: dict, key_set: str) -> bytes:
 
 def _public(section: dict) -> dict:
     return {key: value for key, value in section.items() if key not in ("iv", "digest")}
+
+
+def is_gzip(data: bytes) -> bool:
+    return data.startswith(b"\x1f\x8b")
+
+
+def _open_caf(
+    raw: bytes, caf: dict, issues: list[ParseIssue], label: str, code: str,
+    probe: Optional[Callable[[bytes], bool]] = None,
+) -> tuple[dict, list[Optional[bytes]]]:
+    """Verify a parsed CAF's HMACs and decrypt every section with a complete AES block.
+
+    The header HMAC selects the key set. When it matches neither set, the first set
+    whose first plaintext block of the lowest section satisfies probe is used.
+    """
+    sections = caf["sections"]
+    for section in sections:
+        if section["available_encrypted_size"] < section["encrypted_size"]:
+            issues.append(ParseIssue(
+                "error", f"{code}-truncated-section",
+                f"{label} section {section['id']} is truncated: "
+                f"0x{section['available_encrypted_size']:x} of 0x{section['encrypted_size']:x} "
+                "encrypted bytes available",
+                section["file_offset"] + section["available_encrypted_size"],
+            ))
+    header_key_set = _header_key_set(raw, caf)
+    if header_key_set is None:
+        issues.append(ParseIssue(
+            "error", f"{code}-hmac-mismatch",
+            f"{label} header HMAC matches neither the retail nor the internal key set; "
+            "the header is corrupt or was modified",
+            caf["digest_offset"],
+        ))
+    decryptable = [
+        section["available_encrypted_size"] >= 16 and section["encryption_key_id"] in KEY_SETS["retail"]["cipher"]
+        for section in sections
+    ]
+    key_set = header_key_set or "retail"
+    plaintexts: list[Optional[bytes]] = [None] * len(sections)
+    decryption_error = None
+    try:
+        candidates = [section for section, usable in zip(sections, decryptable) if usable]
+        if header_key_set is None and probe is not None and candidates:
+            first = min(candidates, key=lambda item: item["id"])
+            key_set = next(
+                (name for name in KEY_SETS if probe(_decrypt_section(raw, first, name, 16))), key_set,
+            )
+        plaintexts = [
+            _decrypt_section(raw, section, key_set) if usable else None
+            for section, usable in zip(sections, decryptable)
+        ]
+    except ParseError as exc:
+        decryption_error = str(exc)
+
+    for section in sections:
+        section["hmac"] = _section_hmac(raw, section, key_set)
+        if section["hmac"] == "mismatch":
+            issues.append(ParseIssue(
+                "error", f"{code}-hmac-mismatch",
+                f"{label} section {section['id']} HMAC does not match its ciphertext; "
+                "the section is corrupt or was modified",
+                section["file_offset"],
+            ))
+        elif section["hmac"] == "unknown-key":
+            issues.append(ParseIssue(
+                "warning", f"{code}-hmac-unverified",
+                f"{label} section {section['id']} uses unknown hash key ID {section['hmac_key_id']}; "
+                "its HMAC is not verified",
+                section["file_offset"],
+            ))
+
+    expected_end = caf["header_size"] + caf["total_size"]
+    if len(raw) < expected_end and all(
+        section["encrypted_size"] == section["available_encrypted_size"] for section in sections
+    ):
+        issues.append(ParseIssue(
+            "error", f"{code}-truncated-container",
+            f"{label} file is truncated before its declared end", len(raw),
+        ))
+    elif len(raw) > expected_end:
+        issues.append(ParseIssue(
+            "warning", f"{code}-trailing-data",
+            f"{label} is followed by 0x{len(raw) - expected_end:x} bytes", expected_end,
+        ))
+    return {
+        "version": caf["version"],
+        "cipher": "AES-128-CBC",
+        "header_size": caf["header_size"],
+        "total_size": caf["total_size"],
+        "primary_type_flag": caf["type_flag"],
+        "key_set": key_set,
+        "header_hmac": "verified" if header_key_set else "mismatch",
+        "hmac_verified": header_key_set is not None and all(section["hmac"] == "verified" for section in sections),
+        "decryption_error": decryption_error,
+        "section_count": len(sections),
+        "sections": [_public(section) for section in sections],
+    }, plaintexts
+
+
+def open_caf(
+    raw: bytes, issues: list[ParseIssue], *, label: str = "CAF", code: str = "caf",
+    probe: Optional[Callable[[bytes], bool]] = None,
+) -> tuple[dict, list[Optional[bytes]]]:
+    """Parse a SceCoredump CAF, verify its HMACs, and return its decrypted sections in table order."""
+    return _open_caf(raw, _parse_caf(raw, label), issues, label, code, probe)
 
 
 def _decode_access_parameters(data: bytes) -> dict:
@@ -199,91 +306,84 @@ def _decode_access_parameters(data: bytes) -> dict:
 
 def decrypt_container(raw: bytes, issues: list[ParseIssue]) -> tuple[bytes, dict]:
     caf = _parse_caf(raw, "SPSP2DMP")
-    sections = caf["sections"]
-    for section in sections:
-        if section["available_encrypted_size"] < section["encrypted_size"]:
-            issues.append(ParseIssue(
-                "error", "spsp2dmp-truncated-section",
-                f"SPSP2DMP section {section['id']} is truncated: "
-                f"0x{section['available_encrypted_size']:x} of 0x{section['encrypted_size']:x} "
-                "encrypted bytes available",
-                section["file_offset"] + section["available_encrypted_size"],
-            ))
-    section = next((item for item in sections if item["id"] == 0), None)
+    section = next((item for item in caf["sections"] if item["id"] == 0), None)
     if section is None:
         raise ParseError("SPSP2DMP coredump section 0 is missing")
     if section["encryption_key_id"] not in KEY_SETS["retail"]["cipher"]:
         raise ParseError(f"unsupported SPSP2DMP encryption key ID {section['encryption_key_id']}")
     if section["available_encrypted_size"] < 16:
         raise ParseError("SPSP2DMP coredump section 0 has no complete AES block")
-
-    header_key_set = _header_key_set(raw, caf)
-    if header_key_set is None:
-        issues.append(ParseIssue(
-            "error", "spsp2dmp-hmac-mismatch",
-            "SPSP2DMP header HMAC matches neither the retail nor the internal key set; "
-            "the header is corrupt or was modified",
-            caf["digest_offset"],
-        ))
-    payload = key_set = None
-    for name in [header_key_set] if header_key_set else KEY_SETS:
-        candidate = _decrypt_section(raw, section, name)
-        if candidate.startswith(b"\x1f\x8b"):
-            payload, key_set = candidate, name
-            break
-    if payload is None:
+    container, plaintexts = _open_caf(raw, caf, issues, "SPSP2DMP", "spsp2dmp", is_gzip)
+    if container["decryption_error"]:
+        raise ParseError(container["decryption_error"])
+    payload = plaintexts[caf["sections"].index(section)]
+    if not is_gzip(payload):
         raise ParseError("decrypted SPSP2DMP coredump section 0 does not begin with gzip data")
 
     access_parameters = None
-    for item in sections:
-        item["hmac"] = _section_hmac(raw, item, key_set)
-        if item["hmac"] == "mismatch":
-            issues.append(ParseIssue(
-                "error", "spsp2dmp-hmac-mismatch",
-                f"SPSP2DMP section {item['id']} HMAC does not match its ciphertext; "
-                "the section is corrupt or was modified",
-                item["file_offset"],
-            ))
-        elif item["hmac"] == "unknown-key":
-            issues.append(ParseIssue(
-                "warning", "spsp2dmp-hmac-unverified",
-                f"SPSP2DMP section {item['id']} uses unknown hash key ID {item['hmac_key_id']}; "
-                "its HMAC is not verified",
-                item["file_offset"],
-            ))
-        if (item["id"] != 0 and item["size"] >= ACCESS_PARAMETERS.size
-                and item["available_size"] == item["size"]
-                and item["encryption_key_id"] in KEY_SETS[key_set]["cipher"]):
-            plaintext = _decrypt_section(raw, item, key_set)
-            if plaintext.startswith(b"CDAP"):
-                access_parameters = {"section_id": item["id"], **_decode_access_parameters(plaintext)}
+    for item, plaintext in zip(container["sections"], plaintexts):
+        if (item["id"] != 0 and plaintext is not None and item["available_size"] == item["size"]
+                and len(plaintext) >= ACCESS_PARAMETERS.size and plaintext.startswith(b"CDAP")):
+            access_parameters = {"section_id": item["id"], **_decode_access_parameters(plaintext)}
+    del container["decryption_error"]
+    return payload, {"format": "spsp2dmp", **container, "access_parameters": access_parameters}
 
-    expected_end = caf["header_size"] + caf["total_size"]
-    if len(raw) < expected_end and all(
-        item["encrypted_size"] == item["available_encrypted_size"] for item in sections
-    ):
-        issues.append(ParseIssue(
-            "error", "spsp2dmp-truncated-container",
-            "SPSP2DMP file is truncated before its declared end", len(raw),
-        ))
-    elif len(raw) > expected_end:
-        issues.append(ParseIssue(
-            "warning", "spsp2dmp-trailing-data",
-            f"SPSP2DMP is followed by 0x{len(raw) - expected_end:x} bytes", expected_end,
-        ))
-    return payload, {
-        "format": "spsp2dmp",
-        "version": caf["version"],
-        "cipher": "AES-128-CBC",
-        "header_size": caf["header_size"],
-        "primary_type_flag": caf["type_flag"],
-        "key_set": key_set,
-        "header_hmac": "verified" if header_key_set else "mismatch",
-        "hmac_verified": header_key_set is not None and all(item["hmac"] == "verified" for item in sections),
-        "section_count": len(sections),
-        "sections": [_public(item) for item in sections],
-        "access_parameters": access_parameters,
-    }
+
+def decode_screenshot(container: dict, plaintexts: list[Optional[bytes]]) -> tuple[dict, list[bytes]]:
+    """Decode an opened screenshot CAF: one gzip frame per section."""
+    frames = []
+    pixels = []
+    for index, (section, plaintext) in enumerate(zip(container["sections"], plaintexts)):
+        frame = {
+            "index": index,
+            "source": SCREENSHOT_SOURCES[index] if index < len(SCREENSHOT_SOURCES) else None,
+            "section_id": section["id"],
+            "encryption_key_id": section["encryption_key_id"],
+            "hmac": section["hmac"],
+            "section_size": section["size"],
+            "available_section_size": section["available_size"],
+            "vblank_count": None,
+            "width": None,
+            "height": None,
+            "pixel_format": None,
+            "pixel_bytes": 0,
+            "expected_pixel_bytes": None,
+            "complete": False,
+            "pixel_sha256": None,
+        }
+        frame_pixels = b""
+        if plaintext is not None:
+            body, body_complete = _decompress_gzip(plaintext, [])
+            if len(body) >= SCREENSHOT_FRAME.size:
+                _, vblank_count, width, height, pixel_format = SCREENSHOT_FRAME.unpack_from(body)
+                expected = width * height * 4
+                frame_pixels = body[SCREENSHOT_FRAME.size : SCREENSHOT_FRAME.size + expected]
+                frame.update({
+                    "vblank_count": vblank_count,
+                    "width": width,
+                    "height": height,
+                    "pixel_format": pixel_format,
+                    "pixel_bytes": len(frame_pixels),
+                    "expected_pixel_bytes": expected,
+                    "complete": body_complete and len(body) == SCREENSHOT_FRAME.size + expected,
+                    "pixel_sha256": hashlib.sha256(frame_pixels).hexdigest(),
+                })
+        frames.append(frame)
+        pixels.append(frame_pixels)
+    return {
+        "complete": all(section["available_size"] == section["size"] for section in container["sections"]),
+        "header_complete": True,
+        "container_version": container["version"],
+        "primary_type_flag": container["primary_type_flag"],
+        "header_size": container["header_size"],
+        "total_size": container["total_size"],
+        "key_set": container["key_set"],
+        "header_hmac": container["header_hmac"],
+        "hmac_verified": container["hmac_verified"],
+        "decrypted": any(frame["width"] is not None for frame in frames),
+        "decryption_error": container["decryption_error"],
+        "frames": frames,
+    }, pixels
 
 
 def screenshot_frames(data: bytes) -> tuple[dict, list[bytes]]:
@@ -299,72 +399,29 @@ def screenshot_frames(data: bytes) -> tuple[dict, list[bytes]]:
             "header_hmac": "truncated", "hmac_verified": False, "decrypted": False,
             "decryption_error": None, "frames": [], "container_end": len(data),
         }, []
-    caf = _parse_caf(raw, "SYSTEM_INFO2")
-    header_key_set = _header_key_set(raw, caf)
-    key_set = header_key_set or "retail"
-    frames = []
-    pixels = []
-    decryption_error = None
-    for index, section in enumerate(caf["sections"]):
-        hmac_status = _section_hmac(raw, section, key_set)
-        frame = {
-            "index": index,
-            "source": SCREENSHOT_SOURCES[index] if index < len(SCREENSHOT_SOURCES) else None,
-            "section_id": section["id"],
-            "encryption_key_id": section["encryption_key_id"],
-            "hmac": hmac_status,
-            "section_size": section["size"],
-            "available_section_size": section["available_size"],
-            "vblank_count": None,
-            "width": None,
-            "height": None,
-            "pixel_format": None,
-            "pixel_bytes": 0,
-            "expected_pixel_bytes": None,
-            "complete": False,
-            "pixel_sha256": None,
-        }
-        frame_pixels = b""
-        if (decryption_error is None and section["available_encrypted_size"] >= 16
-                and section["encryption_key_id"] in KEY_SETS[key_set]["cipher"]):
-            try:
-                plaintext = _decrypt_section(raw, section, key_set)
-            except ParseError as exc:
-                decryption_error = str(exc)
-            else:
-                body, body_complete = _decompress_gzip(plaintext, [])
-                if len(body) >= SCREENSHOT_FRAME.size:
-                    _, vblank_count, width, height, pixel_format = SCREENSHOT_FRAME.unpack_from(body)
-                    expected = width * height * 4
-                    frame_pixels = body[SCREENSHOT_FRAME.size : SCREENSHOT_FRAME.size + expected]
-                    frame.update({
-                        "vblank_count": vblank_count,
-                        "width": width,
-                        "height": height,
-                        "pixel_format": pixel_format,
-                        "pixel_bytes": len(frame_pixels),
-                        "expected_pixel_bytes": expected,
-                        "complete": body_complete and len(body) == SCREENSHOT_FRAME.size + expected,
-                        "pixel_sha256": hashlib.sha256(frame_pixels).hexdigest(),
-                    })
-        frames.append(frame)
-        pixels.append(frame_pixels)
+    summary, pixels = decode_screenshot(*open_caf(raw, [], label="SYSTEM_INFO2", probe=is_gzip))
     return {
-        **result,
-        "complete": all(section["available_size"] == section["size"] for section in caf["sections"]),
-        "header_complete": True,
-        "container_version": caf["version"],
-        "primary_type_flag": caf["type_flag"],
-        "header_size": header_size,
-        "total_size": total_size,
-        "key_set": header_key_set,
-        "header_hmac": "verified" if header_key_set else "mismatch",
-        "hmac_verified": header_key_set is not None and all(frame["hmac"] == "verified" for frame in frames),
-        "decrypted": decryption_error is None and any(frame["width"] is not None for frame in frames),
-        "decryption_error": decryption_error,
-        "frames": frames,
-        "container_end": min(len(data), 4 + header_size + total_size),
+        **result, **summary, "container_end": min(len(data), 4 + header_size + total_size),
     }, pixels
+
+
+def decode_crash_report(payload: bytes) -> dict:
+    """Decode crash_report.caf: the finished dump's path and the title ID, NUL-terminated."""
+    path, path_end, rest = payload.partition(b"\0")
+    title_id, title_end, padding = rest.partition(b"\0")
+    return {
+        "corefile_path": path.decode("utf-8", errors="replace"),
+        "corefile_path_complete": bool(path_end),
+        "corefile_name": path.rsplit(b"/", 1)[-1].decode("utf-8", errors="replace"),
+        "title_id": title_id.decode("utf-8", errors="replace") or None,
+        "title_id_complete": bool(title_end),
+        "padding_nonzero_bytes": sum(value != 0 for value in padding),
+    }
+
+
+def looks_like_crash_report(block: bytes) -> bool:
+    head = block.split(b"\0", 1)[0]
+    return b":" in head and all(0x20 <= value < 0x7F for value in head)
 
 
 def describe_hmac(info: dict) -> str:

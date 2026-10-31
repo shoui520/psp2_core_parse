@@ -136,8 +136,17 @@ Extract raw evidence:
   --memory 0x81000000 0x100 --output memory.bin
 ./psp2-core-parse extract dump.spsp2dmp --elf --output outer.elf
 ./psp2-core-parse extract dump.spsp2dmp --kernel-info --output kernel.elf
+./psp2-core-parse extract dump.spsp2dmp --section 1 --output section.bin
 ./psp2-core-parse extract dump.psp2kerndmp --blob --output payload.bin
 ./psp2-core-parse system2 dump.psp2dmp --output display.caf
+```
+
+Inspect standalone SceCoredump CAF files, such as `ux0:data/crash_report.caf` or a screenshot container written by `system2 --output`:
+
+```sh
+./psp2-core-parse info crash_report.caf
+./psp2-core-parse system2 display.caf --frames screenshots/
+./psp2-core-parse extract crash_report.caf --section 0 --output section.bin
 ```
 
 Triage and compare multiple dumps:
@@ -149,7 +158,7 @@ Triage and compare multiple dumps:
 ./psp2-core-parse compare first.psp2dmp second.psp2dmp --json
 ```
 
-Add `--json` for machine-readable output. Incomplete dumps are recovered where possible, with warnings; use `--strict` to reject them. Kernel blob extraction preserves available plaintext even when crash records cannot be decoded. SPSP2DMP containers and `SYSTEM_INFO2` screenshots are checked against their HMACs, and a mismatch is an error. Decrypted kernel dump output is not authenticated.
+Add `--json` for machine-readable output. Incomplete dumps are recovered where possible, with warnings; use `--strict` to reject them. Kernel blob extraction preserves available plaintext even when crash records cannot be decoded. SPSP2DMP containers, CAF files, and `SYSTEM_INFO2` screenshots are checked against their HMACs, and a mismatch is an error. Decrypted kernel dump output is not authenticated.
 
 ## Credits
 
