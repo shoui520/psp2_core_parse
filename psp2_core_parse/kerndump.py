@@ -78,13 +78,20 @@ def _registers(gpr: list[int], cpsr: int) -> dict:
 
 
 def _saved_registers(data: bytes) -> dict:
+    """ThreadSyscallFrame, then (when dumped) the module of its entry point."""
     gpr = list(struct.unpack_from("<13I", data)) + list(struct.unpack_from("<3I", data, 0x50))
     result = _registers(gpr, struct.unpack_from("<I", data, 0x5C)[0])
+    syscall_aux, entry, fpscr, api_declare, tpidrurw = struct.unpack_from("<5I", data, 0x34)
     result.update({
-        "source": "saved-thread", "fpscr": struct.unpack_from("<I", data, 0x3C)[0],
-        "unknown_34": struct.unpack_from("<2I", data, 0x34),
-        "unknown_40": struct.unpack_from("<4I", data, 0x40),
+        "source": "saved-thread", "fpscr": fpscr, "syscall_number": gpr[12],
+        "syscall_aux": syscall_aux, "entry": entry, "api_declare": api_declare, "tpidrurw": tpidrurw,
+        "entry_module": None,
     })
+    if len(data) >= 0x88:
+        fingerprint, base = struct.unpack_from("<2I", data, 0x60)
+        result["entry_module"] = _module(fingerprint, base, entry)
+        if result["entry_module"] is not None:
+            result["entry_module"]["name"] = data[0x68:0x88].split(b"\0", 1)[0].decode("latin-1")
     return result
 
 
@@ -147,6 +154,102 @@ def _exception_context(data: bytes, modules: bytes) -> dict:
         ),
         "waypoint_cursor": cursor, "waypoints": waypoints,
     }
+
+
+def decode_debug_dump(
+    blob: bytes, *, exception: bool, file_offset: int = 0, issues: list[ParseIssue],
+) -> dict:
+    """SceSysmem's per-CPU crash dump: header, backtraces, then the context records.
+
+    The 0x38-byte header is an exception dump (SceDebugForKernel_5D6F0CFC) and
+    the 0x40-byte one an assertion or panic (DebugFaultDump), which adds the
+    caller and its return address. An exception dump carries the
+    SceExcpmgrContext and its waypoint module table; either may end with the
+    current syscall frame.
+    """
+    result = {
+        "header": {}, "kernel_backtrace": [], "user_backtrace": [],
+        "exception_context": None, "saved_thread_registers": None, "trailing": blob,
+    }
+
+    def record(offset: int, size: int, name: str) -> Optional[bytes]:
+        if offset + size <= len(blob):
+            return blob[offset:offset + size]
+        issues.append(ParseIssue(
+            "error", "truncated-kernel-record", f"truncated {name} at blob offset 0x{offset:x} (requires 0x{size:x} bytes)",
+            file_offset + min(offset, len(blob)),
+        ))
+        return None
+
+    if record(0, 4, "blob header") is None:
+        return result
+    size = struct.unpack_from("<I", blob)[0]
+    if size not in (0x38, 0x40):
+        issues.append(ParseIssue(
+            "error", "unsupported-kernel-blob-header",
+            f"unsupported kernel dump blob header size 0x{size:x}; "
+            "preserving container metadata and uninterpreted plaintext",
+            file_offset,
+        ))
+        return result
+    if record(0, size, "blob header") is None:
+        return result
+    _, pid, tid, cpu, time, file_hash, line_hash, func_hash = struct.unpack_from("<4IQ3I", blob)
+    counts_offset = 0x24 if size == 0x38 else 0x2C
+    kernel_count, user_count, stride, register_words, syscall_words = struct.unpack_from("<5I", blob, counts_offset)
+    header = {
+        "size": size, "process_id": pid, "thread_id": tid, "cpu_id": cpu,
+        "system_time_us": time, "file_hash": file_hash, "line_hash": line_hash, "function_hash": func_hash,
+        "kernel_backtrace_count": kernel_count, "user_backtrace_count": user_count,
+        "backtrace_element_size": stride, "register_words": register_words, "syscall_words": syscall_words,
+    }
+    if size == 0x40:
+        header.update(zip(("caller", "lr"), struct.unpack_from("<2I", blob, 0x24)))
+    result["header"] = header
+    if (kernel_count or user_count) and stride < 0x10:
+        issues.append(ParseIssue(
+            "error", "invalid-kernel-backtrace-stride",
+            f"invalid kernel backtrace element stride 0x{stride:x}; subsequent records are uninterpreted",
+            file_offset + counts_offset + 8,
+        ))
+        result["trailing"] = blob[size:]
+        return result
+    offset = used = size
+    for name, count, records in (
+        ("kernel backtrace", kernel_count, result["kernel_backtrace"]),
+        ("user backtrace", user_count, result["user_backtrace"]),
+    ):
+        available = min(count, max(0, len(blob) - offset) // stride) if count else 0
+        if available < count:
+            issues.append(ParseIssue("error", "truncated-kernel-backtrace", f"truncated {name}: {available}/{count} records available"))
+        for index in range(available):
+            start = offset + index * stride
+            sp, pc, fingerprint, base = struct.unpack_from("<4I", blob, start)
+            records.append({
+                "index": index, "sp": sp, "pc": pc, "fingerprint": fingerprint, "module_base": base,
+                "module": _module(fingerprint, base, pc), "extra_hex": blob[start + 16:start + stride].hex(),
+            })
+            used = start + stride
+        # Later records follow the declared arrays, never the salvaged array lengths.
+        offset += count * stride
+    if exception:
+        context = record(offset, 0x400, "exception context")
+        modules = record(offset + 0x400, 0x200, "waypoint module table")
+        if context is not None:
+            result["exception_context"] = _exception_context(context, blob[offset + 0x400:offset + 0x600])
+            used = offset + 0x400
+            if modules is not None:
+                used += 0x200
+        offset += 0x600
+    if syscall_words >= 0x18:
+        registers = record(offset, 0x60, "saved thread registers")
+        if registers is not None:
+            # The frame is 0x60 bytes; the producer appends its entry's module (0x28 bytes).
+            frame_size = 0x88 if syscall_words >= 0x22 and offset + 0x88 <= len(blob) else 0x60
+            result["saved_thread_registers"] = _saved_registers(blob[offset:offset + frame_size])
+            used = offset + frame_size
+    result["trailing"] = blob[used:]
+    return result
 
 
 @dataclass
@@ -218,83 +321,17 @@ class KernelDump:
     def complete(self) -> bool:
         return not any(issue.severity == "error" for issue in self.issues)
 
-    def _record(self, offset: int, size: int, name: str) -> Optional[bytes]:
-        if offset + size <= len(self.blob):
-            return self.blob[offset:offset + size]
-        self.issues.append(ParseIssue(
-            "error", "truncated-kernel-record", f"truncated {name} at blob offset 0x{offset:x} (requires 0x{size:x} bytes)",
-            self.info["blob_file_offset"] + min(offset, len(self.blob)),
-        ))
-        return None
-
     def _decode_blob(self) -> None:
-        self.trailing = self.blob
-        if self._record(0, 4, "blob header") is None:
-            return
-        size = struct.unpack_from("<I", self.blob)[0]
-        if size not in (0x38, 0x40):
-            self.issues.append(ParseIssue(
-                "error", "unsupported-kernel-blob-header",
-                f"unsupported .psp2kerndmp blob header size 0x{size:x}; "
-                "preserving container metadata and uninterpreted plaintext",
-                self.info["blob_file_offset"],
-            ))
-            return
-        if self._record(0, size, "blob header") is None:
-            return
-        _, pid, tid, cpu, time, file_hash, line_hash, func_hash = struct.unpack_from("<4IQ3I", self.blob)
-        counts_offset = 0x24 if size == 0x38 else 0x2C
-        kernel_count, user_count, stride, unknown_size, context_flags = struct.unpack_from("<5I", self.blob, counts_offset)
-        self.header = {
-            "size": size, "process_id": pid, "thread_id": tid, "cpu_id": cpu,
-            "system_time_us": time, "file_hash": file_hash, "line_hash": line_hash, "function_hash": func_hash,
-            "kernel_backtrace_count": kernel_count, "user_backtrace_count": user_count,
-            "backtrace_element_size": stride, "unknown_size": unknown_size, "context_flags": context_flags,
-        }
-        if size == 0x40:
-            self.header.update(zip(("uid_24", "unknown_28"), struct.unpack_from("<2I", self.blob, 0x24)))
-        if (kernel_count or user_count) and stride < 0x10:
-            self.issues.append(ParseIssue(
-                "error", "invalid-kernel-backtrace-stride",
-                f"invalid kernel backtrace element stride 0x{stride:x}; subsequent records are uninterpreted",
-                self.info["blob_file_offset"] + counts_offset + 8,
-            ))
-            self.trailing = self.blob[size:]
-            return
-        offset = used = size
-        for name, count, records in (
-            ("kernel backtrace", kernel_count, self.kernel_backtrace),
-            ("user backtrace", user_count, self.user_backtrace),
-        ):
-            available = min(count, max(0, len(self.blob) - offset) // stride) if count else 0
-            if available < count:
-                self.issues.append(ParseIssue("error", "truncated-kernel-backtrace", f"truncated {name}: {available}/{count} records available"))
-            for index in range(available):
-                start = offset + index * stride
-                sp, pc, fingerprint, base = struct.unpack_from("<4I", self.blob, start)
-                records.append({
-                    "index": index, "sp": sp, "pc": pc, "fingerprint": fingerprint, "module_base": base,
-                    "module": _module(fingerprint, base, pc), "extra_hex": self.blob[start + 16:start + stride].hex(),
-                })
-                used = start + stride
-            # Later records follow the declared arrays, never the salvaged array lengths.
-            offset += count * stride
-        if self.container["type"] == 3:
-            context = self._record(offset, 0x400, "exception context")
-            modules = self._record(offset + 0x400, 0x200, "waypoint module table")
-            if context is not None:
-                available_modules = self.blob[offset + 0x400:offset + 0x600]
-                self.exception_context = _exception_context(context, available_modules)
-                used = offset + 0x400
-                if modules is not None:
-                    used += 0x200
-            offset += 0x600
-        if context_flags == 0x22:
-            registers = self._record(offset, 0x60, "saved thread registers")
-            if registers is not None:
-                self.saved_thread_registers = _saved_registers(registers)
-                used = offset + 0x60
-        self.trailing = self.blob[used:]
+        decoded = decode_debug_dump(
+            self.blob, exception=self.container["type"] == 3,
+            file_offset=self.info["blob_file_offset"], issues=self.issues,
+        )
+        self.header = decoded["header"]
+        self.kernel_backtrace = decoded["kernel_backtrace"]
+        self.user_backtrace = decoded["user_backtrace"]
+        self.exception_context = decoded["exception_context"]
+        self.saved_thread_registers = decoded["saved_thread_registers"]
+        self.trailing = decoded["trailing"]
 
     def summary(self) -> dict:
         return {

@@ -73,6 +73,7 @@ Other basic commands:
 ./psp2-core-parse waits dump.psp2dmp
 ./psp2-core-parse object dump.psp2dmp 0x40010001
 ./psp2-core-parse tty dump.psp2dmp --tail 40
+./psp2-core-parse kernel psp2core-SceKernelProcess.spsp2dmp
 ./psp2-core-parse validate dump.psp2dmp
 ./psp2-core-parse triage *.psp2dmp
 ./psp2-core-parse compare first.psp2dmp second.psp2dmp
@@ -139,6 +140,13 @@ Extract raw evidence:
 ./psp2-core-parse extract dump.spsp2dmp --section 1 --output section.bin
 ./psp2-core-parse extract dump.psp2kerndmp --blob --output payload.bin
 ./psp2-core-parse system2 dump.psp2dmp --output display.caf
+```
+
+Decode the crash core of a kernel coredump (title `NPXS19998`). After a kernel exception, assertion, panic or bus error, SceCrashDump stores its own ARM core as the `KERNEL_INFO` note. `kernel` decrypts it and decodes the crash header, the kernel TTY, SceSysmem's exception or fault dump (registers, waypoints, producer-saved backtraces, the syscall frame), SceKernelBusError's record, and the captured physical memory. `analyze` classifies these dumps from the same data:
+
+```sh
+./psp2-core-parse kernel psp2core-SceKernelProcess.spsp2dmp
+./psp2-core-parse kernel psp2core-SceKernelProcess.spsp2dmp --physical 0x40200000 --size 0x100
 ```
 
 Inspect standalone SceCoredump CAF files, such as `ux0:data/crash_report.caf` or a screenshot container written by `system2 --output`:

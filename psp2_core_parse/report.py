@@ -53,6 +53,126 @@ def _location(thread: dict, key: str) -> str:
     return location["notation"] if location else _hex(address)
 
 
+def render_kernel_info(info: dict, *, tty_lines: int = 40) -> list[str]:
+    """Render a decoded KERNEL_INFO crash core (SceCrashDump) as report sections."""
+    lines: list[str] = []
+    crash = info.get("crash")
+    analysis = info["analysis"]
+    _heading(lines, "KERNEL_CRASH_DUMP")
+    _field(lines, "Classification", analysis["classification"])
+    _field(lines, "Integrity", "complete" if info["complete"] else "SALVAGED")
+    if crash:
+        _field(lines, "Kind", f"{crash['kind_name']} ({crash['kind']})")
+        _field(lines, "CPU", crash["cpu"])
+        _field(lines, "SceCrashDump firmware", f"{crash['firmware']} ({_hex(crash['firmware_version'])})")
+        _field(lines, "TTBR0 / VBAR / sysroot", f"{_hex(crash['ttbr0'])} / {_hex(crash['vbar'])} / {_hex(crash['sysroot'])}")
+        _field(lines, "Session ID", crash["session_id"] or "unavailable")
+    else:
+        lines.append("    The crash header (note 0x1000) was not recovered.")
+    for issue in info["issues"]:
+        lines.append(f"        {issue['severity']} {issue['code']}: {issue['message']}")
+
+    dump = info.get("dump")
+    if dump and dump["header"]:
+        header = dump["header"]
+        _heading(lines, "KERNEL_EXCEPTION_DUMP" if dump["kind"] == "exception" else "KERNEL_FAULT_DUMP")
+        _field(lines, "Process / thread", f"{_hex(header['process_id'])} / {_hex(header['thread_id'])}")
+        _field(lines, "CPU / system time", f"{header['cpu_id']} / {header['system_time_us']} us")
+        _field(
+            lines, "Source hashes",
+            f"file={_hex(header['file_hash'])} line={_hex(header['line_hash'])} function={_hex(header['function_hash'])}",
+        )
+        if "caller" in header:
+            _field(lines, "Caller / return address", f"{_hex(header['caller'])} / {_hex(header['lr'])}")
+        context = dump.get("exception_context")
+        if context:
+            registers = context["registers"]
+            module = context["fault_module"]
+            _field(lines, "Exception reason", context["exception_code"])
+            _field(lines, "PC module", module["notation"] if module else "not a kernel module address")
+            for row in range(0, 16, 4):
+                lines.append("    " + "  ".join(f"r{index:<2}={registers['gpr'][index]:08x}" for index in range(row, row + 4)))
+            _field(lines, "CPSR (SPSR)", f"{_hex(registers['cpsr'])} ({'Thumb' if registers['thumb'] else 'ARM'})")
+            _field(lines, "DFSR / DFAR", f"{_hex(registers['dfsr'])} / {_hex(registers['dfar'])}")
+            _field(lines, "IFSR / IFAR", f"{_hex(registers['ifsr'])} / {_hex(registers['ifar'])}")
+            _field(lines, "TTBR1 / DACR / CONTEXTIDR", f"{_hex(registers['ttbr1'])} / {_hex(registers['dacr'])} / {_hex(registers['contextidr'])}")
+            _field(lines, "FPSCR / FPEXC", f"{_hex(registers['fpscr'])} / {_hex(registers['fpexc'])}")
+            _field(lines, "Waypoints", len(context["waypoints"]))
+            for point in context["waypoints"]:
+                detail = point.get("exception_cause", point.get("instruction_set", point["event_name"]))
+                target = point["target_module"]
+                lines.append(
+                    f"        ({point['index']:2}) {_hex(point['pc'])} -> {_hex(point['target_pc'])} "
+                    f"{detail}{' ' + target['notation'] if target else ''}"
+                )
+        fault = analysis.get("fault")
+        if fault:
+            status = fault["status"]
+            access = "execute" if "write" not in status else "write" if status["write"] else "read"
+            _field(lines, "Fault", f"{status['status_name']} ({access}) at {_hex(fault['address'])}")
+        for label, frames in (("Kernel backtrace", dump["kernel_backtrace"]), ("User backtrace", dump["user_backtrace"])):
+            _field(lines, label, f"{len(frames)} producer-saved frame(s)")
+            for frame in frames:
+                module = frame["module"]
+                lines.append(
+                    f"        #{frame['index']:<2} PC={_hex(frame['pc'])} SP={_hex(frame['sp'])} "
+                    f"{module['notation'] if module else 'no module'}"
+                )
+        saved = dump.get("saved_thread_registers")
+        if saved:
+            module = saved.get("entry_module")
+            where = f" in {module['name'] or '?'} ({module['notation']})" if module else ""
+            _field(lines, "Syscall", f"r12={_hex(saved['syscall_number'])} entry={_hex(saved['entry'])}{where}")
+            _field(lines, "Syscall caller", f"PC={_hex(saved['pc'])} LR={_hex(saved['lr'])} SP={_hex(saved['sp'])}")
+
+    bus = info.get("bus_error")
+    if bus:
+        _heading(lines, "KERNEL_BUS_ERROR")
+        _field(lines, "Record", f"0x{bus['size']:x} bytes; {'complete' if bus['complete'] else 'TRUNCATED'}")
+        ocp = bus.get("ocp")
+        if ocp:
+            _field(lines, "BET0 / BET1 / BEBT", f"{_hex(ocp['bet0'])} / {_hex(ocp['bet1'])} / {_hex(ocp['bebt'])}")
+            _field(lines, "Buses in error", ", ".join(ocp["buses_in_error"]) or "none")
+            for item in ocp["target_errors"]:
+                lines.append(
+                    f"        {item['target']:<10} address={_hex(item['address'])} "
+                    f"attribute={_hex(item['attribute'])} ({item['log']} log)"
+                )
+        for item in (bus.get("si") or {}).get("buses", []):
+            for agent in item["agent_errors"]:
+                lines.append(
+                    f"        {agent['agent']}: status={_hex(agent['status'] & 0xFFFFFFFF)} "
+                    f"log={agent['error_log']:#014x} address={agent['error_address']:#010x}"
+                )
+        for name, block, flags in (("GRAB", bus.get("grab"), (("status", 4, "write"), ("status", 2, "read"), ("secure_status", 4, "secure_write"), ("secure_status", 2, "secure_read"))),
+                                   ("REGBUS", bus.get("regbus"), (("status", 1, "error"), ("secure_status", 1, "secure_error")))):
+            if not block:
+                continue
+            for status, bit, prefix in flags:
+                if block[status] & bit:
+                    _field(
+                        lines, f"{name} {prefix.replace('_', ' ')}",
+                        " ".join(f"{key}={_hex(block[f'{prefix}_{key}'])}" for key in ("id", "address", "attribute", "info")),
+                    )
+
+    _heading(lines, "KERNEL_PHYSICAL_MEMORY")
+    for segment in info["segments"]:
+        where = _hex(segment["physical_address"]) if segment["physical_address"] is not None else f"{segment.get('page_count', 0)} mapped pages"
+        lines.append(
+            f"    [{segment['index']}] {segment['role']:<5} {where} "
+            f"0x{segment['available_size']:x}/0x{segment['size']:x} bytes ({_size(segment['size'])})"
+        )
+    if not info["segments"]:
+        lines.append("    No memory segments: SceCrashDump records memory only on development and QA units.")
+
+    tty = info.get("tty")
+    if tty and tty["text"].strip():
+        text = tty["text"].rstrip("\n").split("\n")
+        _heading(lines, f"KERNEL_TTY (last {min(tty_lines, len(text))} of {len(text)} lines)")
+        lines.extend(f"    {line}" for line in text[-tty_lines:])
+    return lines
+
+
 def render_analysis_report(result: dict) -> str:
     """Render the default, comprehensive evidence report for ``analyze``."""
     lines = [ANALYSIS_BANNER, "", result["classification"], "", result["verdict"]]
@@ -273,6 +393,9 @@ def render_analysis_report(result: dict) -> str:
                 f"        [{block['index']:02d}] {_hex(block['base'])}-{_hex(block['end'])} "
                 f"uid={_hex(block['uid'])} {block['name']}"
             )
+
+    if result.get("kernel_info"):
+        lines.extend(render_kernel_info(result["kernel_info"]))
 
     _heading(lines, "CPU_THREADS")
     _field(lines, "Thread count", execution["thread_count"])

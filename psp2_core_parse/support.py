@@ -950,6 +950,11 @@ def decode_note(note: Note, core: CoreDump, execution: Optional[ExecutionContext
         if note.name == "SUMMARY_INFO":
             value = SummaryInfo.parse(note.description).summary(core)
             return DecodedNote(note, status(value), "SummaryInfo", value, None)
+        if note.name == "KERNEL_INFO":
+            from .kernel_info import KernelInfo
+
+            value = KernelInfo.parse(note.description).summary()
+            return DecodedNote(note, status(value), "KernelInfo", value, None)
         if note.name in KERNEL_PARSERS:
             value = KERNEL_PARSERS[note.name](note.description).summary()
             return DecodedNote(note, status(value), "KernelObjectTable", value, None)

@@ -240,6 +240,12 @@ def build_parser() -> argparse.ArgumentParser:
     item.add_argument("--tail", type=positive_integer)
     item.add_argument("--ansi", action="store_true", help="preserve ANSI control sequences")
 
+    item = commands.add_parser("kernel", help="decode the KERNEL_INFO crash core of a kernel coredump")
+    _add_core_arguments(item)
+    item.add_argument("--tty-lines", type=positive_integer, default=40, help="kernel TTY lines to show")
+    item.add_argument("--physical", type=integer, metavar="ADDRESS", help="hex-dump captured physical memory")
+    item.add_argument("--size", type=positive_integer, default=0x100, help="bytes to dump with --physical")
+
     item = commands.add_parser("validate", help="exercise all decoders and report coverage")
     _add_core_arguments(item)
 
@@ -1139,6 +1145,25 @@ def command_tty(args) -> tuple[object, str]:
     return results, "\n".join(texts)
 
 
+def command_kernel(args) -> tuple[dict, str]:
+    from .kernel_info import KernelInfo
+    from .report import render_kernel_info
+
+    core = _core(args)
+    note = core.note("KERNEL_INFO")
+    if note is None:
+        raise ParseError("KERNEL_INFO was not recovered; only kernel coredumps (title NPXS19998) carry it")
+    info = KernelInfo.parse(note.description, strict=args.strict)
+    if args.physical is not None:
+        data = info.read_physical(args.physical, args.size)
+        if data is None:
+            raise ParseError(f"physical range {_hex(args.physical)}+0x{args.size:x} was not captured")
+        return {"physical_address": args.physical, "size": len(data), "bytes": data.hex()}, _hexdump(data, args.physical)
+    summary = info.summary()
+    lines = [summary["analysis"]["verdict"], *render_kernel_info(summary, tty_lines=args.tty_lines)]
+    return summary, "\n".join(lines)
+
+
 def command_validate(args) -> tuple[dict, str]:
     core = _core(args); execution = _execution(core); context = supporting_context(core, execution)
     registry = KernelObjectRegistry.parse(core)
@@ -1418,7 +1443,7 @@ COMMANDS = {
     "summary": command_summary, "context": command_context, "system2": command_system2,
     "map": command_map, "address": command_address, "memory": command_memory,
     "xref": command_xref, "search": command_search, "disasm": command_disasm,
-    "waits": command_waits, "object": command_object, "tty": command_tty,
+    "waits": command_waits, "object": command_object, "tty": command_tty, "kernel": command_kernel,
     "validate": command_validate, "triage": command_triage, "compare": command_compare,
     "extract": command_extract,
 }

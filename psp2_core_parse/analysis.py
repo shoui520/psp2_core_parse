@@ -224,6 +224,19 @@ def _failure_bucket(classification: str, thread: Optional[Thread], registers: Op
     }
 
 
+def _kernel_info(core: CoreDump) -> Optional[dict]:
+    """The decoded KERNEL_INFO crash core of a kernel coredump, if one was recovered."""
+    note = core.note("KERNEL_INFO")
+    if note is None:
+        return None
+    from .kernel_info import KernelInfo
+
+    try:
+        return KernelInfo.parse(note.description).summary()
+    except ParseError:
+        return None
+
+
 @dataclass(frozen=True)
 class Analysis:
     result: dict
@@ -257,11 +270,18 @@ class Analysis:
             primary_summary["instruction_evidence"] = _instruction_evidence(core, registers) if registers else None
             primary_summary["waiting_on"] = [item.summary() for item in kernel.waiting_objects(primary.uid)]
         context = supporting_context(core, execution)
+        verdict = _verdict(classification, primary, registers, execution)
+        bucket = _failure_bucket(classification, primary, registers, execution)
+        kernel_info = _kernel_info(core) if primary is None else None
+        if kernel_info is not None:
+            crash = kernel_info["analysis"]
+            classification, verdict = crash["classification"], crash["verdict"]
+            bucket = {**crash["failure_bucket"], "aslr_independent": crash["location"] is not None}
         result = {
             "schema": "psp2_core_parse.analysis.v1",
             "classification": classification,
-            "verdict": _verdict(classification, primary, registers, execution),
-            "failure_bucket": _failure_bucket(classification, primary, registers, execution),
+            "verdict": verdict,
+            "failure_bucket": bucket,
             "container": core.summary(),
             "dump": _dump_integrity(core, summary),
             "corefile": corefile,
@@ -270,6 +290,7 @@ class Analysis:
             "build": build,
             "metadata_errors": {"corefile": corefile_error, "application": app_error, "build": build_error},
             "primary_crash_thread": primary_summary,
+            "kernel_info": kernel_info,
             "fault": fault_evidence,
             "crashed_threads": [execution.thread_summary(core, item, stack_candidates=stack_candidates) for item in execution.crashed_threads],
             "execution_context": execution.summary(core, stack_candidates=stack_candidates),
